@@ -605,9 +605,6 @@ XBSYSAPI EXPORTNUM(352) void_xt NTAPI RtlRip
  PCHAR	Message
 );
 
-void_xt RtlInitSystem();
-extern RTL_CRITICAL_SECTION NtSystemTimeCritSec;
-
 }
 
 #endif

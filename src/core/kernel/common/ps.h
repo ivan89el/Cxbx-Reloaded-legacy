@@ -14,17 +14,18 @@
 
 #include "types.h"
 
-#define X_THREAD_QUANTUM 60
-
 namespace xbox
 {
+
+#define PsGetCurrentThread() (CONTAINING_RECORD((KeGetCurrentThread()),ETHREAD,Tcb))
+
 // ******************************************************************
 // * PsCreateSystemThread
 // ******************************************************************
 XBSYSAPI EXPORTNUM(254) ntstatus_xt NTAPI PsCreateSystemThread
 (
 	OUT PHANDLE         ThreadHandle,
-	OUT PHANDLE          ThreadId OPTIONAL,
+	OUT PDWORD          ThreadId OPTIONAL,
 	IN  PKSTART_ROUTINE StartRoutine,
 	IN  PVOID           StartContext,
 	IN  boolean_xt         DebuggerThread
@@ -39,7 +40,7 @@ XBSYSAPI EXPORTNUM(255) ntstatus_xt NTAPI PsCreateSystemThreadEx
 	IN  ulong_xt           ThreadExtensionSize,
 	IN  ulong_xt           KernelStackSize,
 	IN  ulong_xt           TlsDataSize,
-	OUT PHANDLE          ThreadId OPTIONAL,
+	OUT PDWORD          ThreadId OPTIONAL,
 	IN  PKSTART_ROUTINE StartRoutine,
 	IN  PVOID           StartContext,
 	IN  boolean_xt         CreateSuspended,
@@ -68,9 +69,7 @@ XBSYSAPI EXPORTNUM(257) ntstatus_xt NTAPI PsSetCreateThreadNotifyRoutine
 // ******************************************************************
 XBSYSAPI EXPORTNUM(258) void_xt NTAPI PsTerminateSystemThread(IN ntstatus_xt ExitStatus);
 
-XBSYSAPI EXPORTNUM(259) OBJECT_TYPE PsThreadObjectType;
-
-PETHREAD PspGetCurrentThread();
+XBSYSAPI EXPORTNUM(259) volatile OBJECT_TYPE PsThreadObjectType;
 
 }
 

@@ -89,7 +89,6 @@ ntstatus_xt ObpReferenceObjectByName(
 	(p)->ObjectName = n;      \
 }
 
-extern KEVENT ObpDefaultObject;
 boolean_xt ObInitSystem();
 boolean_xt ObpExtendObjectHandleTable();
 void_xt ObDissectName(OBJECT_STRING Path, POBJECT_STRING FirstName, POBJECT_STRING RemainingName);
@@ -99,7 +98,6 @@ ulong_xt FASTCALL ObpComputeHashIndex(POBJECT_STRING ElementName);
 PVOID ObpDestroyObjectHandle(HANDLE Handle);
 void_xt ObpDetachNamedObject(PVOID Object, KIRQL OldIrql);
 ntstatus_xt ObpClose(HANDLE Handle);
-ntstatus_xt ObpResolveLinkTarget(POBJECT_STRING LinkTarget, PVOID* LinkTargetObject);
 
 boolean_xt ObpLookupElementNameInDirectory(
 	IN POBJECT_DIRECTORY Directory,
