@@ -33,9 +33,8 @@
 #include "Logging.h" // For LOG_FUNC()
 #include "EmuKrnl.h" // For InitializeListHead(), etc.
 #include "EmuKrnlLogging.h"
-#include "core\kernel\init\CxbxKrnl.h" // For CxbxrAbort, and CxbxExec
+#include "core\kernel\init\CxbxKrnl.h" // For CxbxrKrnlAbort, and CxbxExec
 #include "core\kernel\support\Emu.h" // For EmuLog(LOG_LEVEL::WARNING, )
-#include "core\kernel\support\EmuFS.h"
 #include "EmuKrnl.h"
 #include "devices\x86\EmuX86.h" // HalReadWritePciSpace needs this
 #include "EmuShared.h"
@@ -43,8 +42,8 @@
 #include "common\EmuEEPROM.h" // For EEPROM
 #include "devices\Xbox.h" // For g_SMBus, SMBUS_ADDRESS_SYSTEM_MICRO_CONTROLLER
 #include "devices\SMCDevice.h" // For SMC_COMMAND_SCRATCH
+#include "common/util/strConverter.hpp" // for utf16_to_ascii
 #include "core\kernel\memory-manager\VMManager.h"
-#include "common/FilePaths.hpp"
 
 #include <algorithm> // for std::replace
 #include <locale>
@@ -59,6 +58,13 @@ uint32_t ResetOrShutdownDataValue = 0;
 
 // global list of routines executed during a reboot
 xbox::LIST_ENTRY ShutdownRoutineList = { &ShutdownRoutineList , &ShutdownRoutineList }; // see InitializeListHead()
+
+
+// ******************************************************************
+// * Declaring this in a header causes errors with xboxkrnl
+// * namespace, so we must declare it within any file that uses it
+// ******************************************************************
+xbox::KPCR* WINAPI KeGetPcr();
 
 #define TRAY_CLOSED_MEDIA_PRESENT 0x60
 #define TRAY_CLOSED_NO_MEDIA 0x40
@@ -181,7 +187,7 @@ XBSYSAPI EXPORTNUM(43) xbox::void_xt NTAPI xbox::HalEnableSystemInterrupt
 
 #ifdef _DEBUG_TRACE
 // Source : Xbox Linux
-const char *IRQNames[MAX_BUS_INTERRUPT_LEVEL + 1] =
+char *IRQNames[MAX_BUS_INTERRUPT_LEVEL + 1] =
 {
 	"<unknown>",
 	"USB0", // IRQ 1 USB Controller: nVidia Corporation nForce USB Controller (rev d4) (prog-if 10 [OHCI])
@@ -452,10 +458,10 @@ XBSYSAPI EXPORTNUM(48) xbox::void_xt FASTCALL xbox::HalRequestSoftwareInterrupt
 	HalInterruptRequestRegister |= InterruptMask;
 
 	// Get current IRQL
-	PKPCR Pcr = EmuKeGetPcr();
+	PKPCR Pcr = KeGetPcr();
 	KIRQL CurrentIrql = (KIRQL)Pcr->Irql;
 
-	// Get pending Software Interrupts (by masking off the HW interrupt bits)
+	// Get pending Software Interrupts (by masking of the HW interrupt bits)
 	uint8_t SoftwareInterrupt = HalInterruptRequestRegister & 3;
 
 	// Get the highest pending software interrupt level
@@ -483,7 +489,7 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 
 	switch (Routine) {
 	case ReturnFirmwareHalt:
-		CxbxrAbort("Emulated Xbox is halted");
+		CxbxrKrnlAbort("Emulated Xbox is halted");
 		break;
 
 	case ReturnFirmwareReboot:
@@ -545,20 +551,16 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 
 			// If the title path was an empty string, we need to launch the dashboard
 			// Or in the case of Chihiro: SEGABOOT
-			std::string XbePath;
 			if (TitlePath.length() == 0) {
 				if (g_bIsChihiro) {
-					//TitlePath = DevicePrefix + "\\" + MediaBoardRomFile;
-					XbePath = g_MediaBoardBasePath + "\\" + MediaBoardRomFile;
+					TitlePath = DevicePrefix + "\\" + MediaBoardRomFile;
 				}
 				else {
 					TitlePath = DeviceHarddisk0Partition2 + "\\xboxdash.xbe";
 				}
 			}
 
-			if (XbePath.empty()) {
-				XbePath = CxbxConvertXboxToHostPath(TitlePath);
-			}
+			std::string& XbePath = CxbxConvertXboxToHostPath(TitlePath);
 
 			// Relaunch Cxbx, to load another Xbe
 			{
@@ -587,7 +589,6 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 	case ReturnFirmwareFatal:
 	{
 		xbox::HalWriteSMBusValue(SMBUS_ADDRESS_SYSTEM_MICRO_CONTROLLER, SMC_COMMAND_SCRATCH, 0, SMC_SCRATCH_DISPLAY_FATAL_ERROR);
-		is_reboot = true;
 
 		g_VMManager.SavePersistentMemory();
 
@@ -603,7 +604,8 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 		LOG_UNIMPLEMENTED();
 	}
 
-	CxbxrShutDown(is_reboot);
+	CxbxKrnlShutDown(is_reboot);
+	TerminateProcess(GetCurrentProcess(), EXIT_SUCCESS);
 }
 
 // ******************************************************************

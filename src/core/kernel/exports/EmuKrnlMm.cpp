@@ -34,7 +34,7 @@
 #include "Logging.h" // For LOG_FUNC()
 #include "EmuKrnl.h" // For DefaultLaunchDataPage
 #include "EmuKrnlLogging.h"
-#include "core\kernel\init\CxbxKrnl.h" // For CxbxrAbort
+#include "core\kernel\init\CxbxKrnl.h" // For CxbxrKrnlAbort
 #include "core\kernel\support\Emu.h" // For EmuLog(LOG_LEVEL::WARNING, )
 #include "core\kernel\memory-manager\VMManager.h"
 #include "EmuShared.h"
@@ -49,7 +49,7 @@ namespace NtDll
 // ******************************************************************
 // * 0x0066 - MmGlobalData
 // ******************************************************************
-XBSYSAPI EXPORTNUM(102) xbox::MMGLOBALDATA xbox::MmGlobalData = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+XBSYSAPI EXPORTNUM(102) xbox::PVOID xbox::MmGlobalData[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 
 // ******************************************************************
 // * 0x00A4 - LaunchDataPage

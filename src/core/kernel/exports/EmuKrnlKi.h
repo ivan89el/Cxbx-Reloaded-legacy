@@ -47,51 +47,42 @@ namespace xbox
 		int Acquired;
 	} KI_TIMER_LOCK;
 
-	typedef struct _KI_WAIT_LIST_LOCK
-	{
-		std::recursive_mutex Mtx;
-		int Acquired;
-	} KI_WAIT_LIST_LOCK;
 
-	// NOTE: since the apc list is per-thread, we could also create a different mutex for each kthread
-	extern std::mutex KiApcListMtx;
+	xbox::void_xt KiInitSystem();
 
-	void_xt KiInitSystem();
+	xbox::void_xt KiTimerLock();
 
-	void_xt KiTimerLock();
+	xbox::void_xt KiTimerUnlock();
 
-	void_xt KiTimerUnlock();
-
-	void_xt KiWaitListLock();
-
-	void_xt KiWaitListUnlock();
-
-	void_xt KiClockIsr(ulonglong_xt TotalUs);
+	xbox::void_xt KiClockIsr
+	(
+		IN unsigned int ScalingFactor
+	);
 
 	xbox::void_xt NTAPI KiCheckTimerTable
 	(
 		IN ULARGE_INTEGER CurrentTime
 	);
 
-	void_xt KxInsertTimer
+	xbox::void_xt KxInsertTimer
 	(
 		IN PKTIMER Timer,
 		IN ulong_xt Hand
 	);
 
-	void_xt FASTCALL KiCompleteTimer
+	xbox::void_xt FASTCALL KiCompleteTimer
 	(
 		IN PKTIMER Timer,
 		IN ulong_xt Hand
 	);
 
-	void_xt KiRemoveEntryTimer
+	xbox::void_xt KiRemoveEntryTimer
 	(
 		IN PKTIMER Timer,
 		IN ulong_xt Hand
 	);
 
-	void_xt KxRemoveTreeTimer
+	xbox::void_xt KxRemoveTreeTimer
 	(
 		IN PKTIMER Timer
 	);
@@ -108,7 +99,7 @@ namespace xbox
 		IN LARGE_INTEGER Interval
 	);
 
-	ulong_xt KiComputeTimerTableIndex
+	xbox::ulong_xt KiComputeTimerTableIndex
 	(
 		IN ulonglong_xt Interval
 	);
@@ -125,7 +116,7 @@ namespace xbox
 		IN PKTIMER Timer
 	);
 
-	void_xt NTAPI KiTimerExpiration
+	xbox::void_xt NTAPI KiTimerExpiration
 	(
 		IN PKDPC Dpc,
 		IN PVOID DeferredContext,
@@ -133,115 +124,18 @@ namespace xbox
 		IN PVOID SystemArgument2
 	);
 
-	void_xt FASTCALL KiTimerListExpire
+	xbox::void_xt FASTCALL KiTimerListExpire
 	(
 		IN PLIST_ENTRY ExpiredListHead,
 		IN KIRQL OldIrql
 	);
 
-	void_xt KiWaitSatisfyAll
+	xbox::void_xt FASTCALL KiWaitSatisfyAll
 	(
 		IN PKWAIT_BLOCK WaitBlock
 	);
-
-	void_xt KiExecuteKernelApc();
-	void_xt KiExecuteUserApc();
-
-	PLARGE_INTEGER FASTCALL KiComputeWaitInterval
-	(
-		IN PLARGE_INTEGER OriginalTime,
-		IN PLARGE_INTEGER DueTime,
-		IN OUT PLARGE_INTEGER NewTime,
-		OUT ulonglong_xt *Now
-	);
-
-	PLARGE_INTEGER FASTCALL KiComputeWaitInterval
-	(
-		IN PLARGE_INTEGER OriginalTime,
-		IN PLARGE_INTEGER DueTime,
-		IN OUT PLARGE_INTEGER NewTime
-	);
-
-	// Source: ReactOS
-	void_xt NTAPI KiSuspendNop
-	(
-		IN PKAPC Apc,
-		IN PKNORMAL_ROUTINE* NormalRoutine,
-		IN PVOID* NormalContext,
-		IN PVOID* SystemArgument1,
-		IN PVOID* SystemArgument2
-	);
-
-	void_xt NTAPI KiFreeUserApc
-	(
-		IN PKAPC Apc,
-		IN PKNORMAL_ROUTINE *NormalRoutine,
-		IN PVOID *NormalContext,
-		IN PVOID *SystemArgument1,
-		IN PVOID *SystemArgument2
-	);
-
-	// Source: ReactOS
-	void_xt NTAPI KiSuspendThread(
-		IN PVOID NormalContext,
-		IN PVOID SystemArgument1,
-		IN PVOID SystemArgument2
-	);
-
-	void_xt NTAPI KiThreadStartup(void_xt);
-
-	xbox::void_xt KiInitializeContextThread(
-		IN PKTHREAD Thread,
-		IN ulong_xt TlsDataSize,
-		IN PKSYSTEM_ROUTINE SystemRoutine,
-		IN PKSTART_ROUTINE StartRoutine,
-		IN PVOID StartContext
-	);
-
-	boolean_xt KiInsertQueueApc
-	(
-		IN PRKAPC Apc,
-		IN KPRIORITY Increment
-	);
-
-	void_xt KiWaitTest
-	(
-		IN PVOID Object,
-		IN KPRIORITY Increment
-	);
-
-	void_xt KiWaitSatisfyAll
-	(
-		IN PKWAIT_BLOCK FirstBlock
-	);
-
-	void_xt KiWaitSatisfyAllAndLock
-	(
-		IN PKWAIT_BLOCK FirstBlock
-	);
-
-	void_xt KiUnwaitThread
-	(
-		IN PKTHREAD Thread,
-		IN long_ptr_xt WaitStatus,
-		IN KPRIORITY Increment
-	);
-
-	void_xt KiUnwaitThreadAndLock
-	(
-		IN PKTHREAD Thread,
-		IN long_ptr_xt WaitStatus,
-		IN KPRIORITY Increment
-	);
-
-	void_xt KiUnlinkThread
-	(
-		IN PKTHREAD Thread,
-		IN long_ptr_xt WaitStatus
-	);
 };
 
-extern xbox::KPROCESS KiUniqueProcess;
 extern const xbox::ulong_xt CLOCK_TIME_INCREMENT;
 extern xbox::LIST_ENTRY KiWaitInListHead;
 extern xbox::KTIMER_TABLE_ENTRY KiTimerTableListHead[TIMER_TABLE_SIZE];

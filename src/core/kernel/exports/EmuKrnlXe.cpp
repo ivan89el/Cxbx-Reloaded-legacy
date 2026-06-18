@@ -30,14 +30,11 @@
 
 
 #include <core\kernel\exports\xboxkrnl.h> // For XeImageFileName, etc.
-#ifdef CXBXR_EMU
 #include "core\kernel\init\CxbxKrnl.h" // For CxbxKrnl_Xbe
-#endif
 #include "Logging.h" // For LOG_FUNC()
 #include "EmuKrnlLogging.h"
-#ifdef CXBXR_EMU
 #include "core\kernel\memory-manager\VMManager.h"
-#endif
+
 // ******************************************************************
 // * 0x0146 - XeImageFileName
 // ******************************************************************
@@ -50,8 +47,6 @@ XBSYSAPI EXPORTNUM(326) xbox::OBJECT_STRING xbox::XeImageFileName =
 
 };
 
-
-#ifdef CXBXR_EMU
 // ******************************************************************
 // * 0x0147 - XeLoadSection()
 // ******************************************************************
@@ -166,7 +161,6 @@ XBSYSAPI EXPORTNUM(328) xbox::ntstatus_xt NTAPI xbox::XeUnloadSection
 
 	RETURN(ret);
 }
-#endif
 
 // ******************************************************************
 // * 0x0163 - XePublicKeyData

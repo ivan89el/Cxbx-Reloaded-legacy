@@ -29,9 +29,6 @@
 
 
 #include <core\kernel\exports\xboxkrnl.h>
-#include <core\kernel\exports\EmuKrnlKi.h>
-#include "core\kernel\support\EmuFS.h"
-#include "core\kernel\support\NativeHandle.h"
 #include <cstdio>
 #include <cctype>
 #include <clocale>
@@ -85,8 +82,6 @@ void InsertTailList(xbox::PLIST_ENTRY pListHead, xbox::PLIST_ENTRY pEntry)
 //#define RemoveEntryList(e) do { PLIST_ENTRY f = (e)->Flink, b = (e)->Blink; f->Blink = b; b->Flink = f; (e)->Flink = (e)->Blink = NULL; } while (0)
 
 // Returns TRUE if the list has become empty after removing the element, FALSE otherwise.
-// NOTE: this function is a mess. _EX_Flink and _EX_Flink should never be nullptr, and it should never be called on a detached element either. Try to fix
-// the bugs in the caller instead of trying to handle it here with these hacks
 xbox::boolean_xt RemoveEntryList(xbox::PLIST_ENTRY pEntry)
 {
 	xbox::PLIST_ENTRY _EX_Flink = pEntry->Flink;
@@ -124,6 +119,12 @@ xbox::PLIST_ENTRY RemoveTailList(xbox::PLIST_ENTRY pListHead)
 	return Result;
 }
 
+// ******************************************************************
+// * Declaring this in a header causes errors with xboxkrnl
+// * namespace, so we must declare it within any file that uses it
+// ******************************************************************
+xbox::KPCR* WINAPI KeGetPcr();
+
 // Interrupts
 
 extern volatile DWORD HalInterruptRequestRegister;
@@ -142,10 +143,12 @@ void RestoreInterruptMode(bool value)
 	g_bInterruptsEnabled = value;
 }
 
+extern void ExecuteDpcQueue();
+
 void KiUnexpectedInterrupt()
 {
 	xbox::KeBugCheck(TRAP_CAUSE_UNKNOWN); // see
-	CxbxrAbort("Unexpected Software Interrupt!");
+	CxbxrKrnlAbort("Unexpected Software Interrupt!");
 }
 
 void CallSoftwareInterrupt(const xbox::KIRQL SoftwareIrql)
@@ -154,14 +157,11 @@ void CallSoftwareInterrupt(const xbox::KIRQL SoftwareIrql)
 	case PASSIVE_LEVEL:
 		KiUnexpectedInterrupt();
 		break;
-	case APC_LEVEL: // = 1 HalpApcInterrupt
-		xbox::KiExecuteKernelApc();
+	case APC_LEVEL: // = 1 // HalpApcInterrupt        
+		EmuLog(LOG_LEVEL::WARNING, "Unimplemented Software Interrupt (APC)"); // TODO : ExecuteApcQueue();
 		break;
 	case DISPATCH_LEVEL: // = 2
-		// This can be recursively called by KiUnlockDispatcherDatabase and KfLowerIrql, so avoid calling DPCs again if the current one has queued yet another one
-		if (!IsDpcActive()) { // Avoid KeIsExecutingDpc(), as that logs
-			ExecuteDpcQueue();
-		}
+		ExecuteDpcQueue();
 		break;
 	case APC_LEVEL | DISPATCH_LEVEL: // = 3
 		KiUnexpectedInterrupt();
@@ -178,34 +178,6 @@ void CallSoftwareInterrupt(const xbox::KIRQL SoftwareIrql)
 	HalInterruptRequestRegister ^= (1 << SoftwareIrql);
 }
 
-bool AddWaitObject(xbox::PKTHREAD kThread, xbox::PLARGE_INTEGER Timeout)
-{
-	// Use the built-in ktimer as a dummy wait object, so that KiUnwaitThreadAndLock can still work
-	xbox::KiTimerLock();
-	xbox::PKWAIT_BLOCK WaitBlock = &kThread->TimerWaitBlock;
-	kThread->WaitBlockList = WaitBlock;
-	xbox::PKTIMER Timer = &kThread->Timer;
-	WaitBlock->NextWaitBlock = WaitBlock;
-	Timer->Header.WaitListHead.Flink = &WaitBlock->WaitListEntry;
-	Timer->Header.WaitListHead.Blink = &WaitBlock->WaitListEntry;
-	if (Timeout && Timeout->QuadPart) {
-		// Setup a timer so that KiTimerExpiration can discover the timeout and yield to us.
-		// Otherwise, we will only be able to discover the timeout when Windows decides to schedule us again, and testing shows that
-		// tends to happen much later than the due time
-		if (xbox::KiInsertTreeTimer(Timer, *Timeout) == FALSE) {
-			// Sanity check: set WaitBlockList to nullptr so that we can catch the case where a waiter starts a new wait but forgets to setup a new wait block. This
-			// way, we will crash instead of silently using the pointer to the old block
-			kThread->WaitBlockList = xbox::zeroptr;
-			xbox::KiTimerUnlock();
-			return false;
-		}
-	}
-	kThread->State = xbox::Waiting;
-	xbox::KiTimerUnlock();
-	return true;
-}
-
-// This masks have been verified to be correct against a kernel dump
 const DWORD IrqlMasks[] = {
 	0xFFFFFFFE, // IRQL 0
 	0xFFFFFFFC, // IRQL 1 (APC_LEVEL)
@@ -214,18 +186,18 @@ const DWORD IrqlMasks[] = {
 	0x03FFFFF0, // IRQL 4
 	0x01FFFFF0, // IRQL 5
 	0x00FFFFF0, // IRQL 6
-	0x007FFFF0, // IRQL 7
-	0x003FFFF0, // IRQL 8
-	0x001FFFF0, // IRQL 9
-	0x000FFFF0, // IRQL 10
-	0x0007FFF0, // IRQL 11
-	0x0003FFF0, // IRQL 12
-	0x0001FFF0, // IRQL 13 (same as IRQL 14)
-	0x0001FFF0, // IRQL 14 (same as IRQL 13)
+	0x00EFFFF0, // IRQL 7
+	0x007FFFF0, // IRQL 8
+	0x003FFFF0, // IRQL 9
+	0x001FFFF0, // IRQL 10
+	0x000EFFF0, // IRQL 11
+	0x0007FFF0, // IRQL 12
+	0x0003FFF0, // IRQL 13
+	0x0001FFF0, // IRQL 14
 	0x00017FF0, // IRQL 15
 	0x00013FF0, // IRQL 16
-	0x00011FF0, // IRQL 17 (same as IRQL 18)
-	0x00011FF0, // IRQL 18 (same as IRQL 17)
+	0x00011FF0, // IRQL 17
+	0x00011FF0, // IRQL 18
 	0x000117F0, // IRQL 19
 	0x000113F0, // IRQL 20
 	0x000111F0, // IRQL 21
@@ -240,7 +212,6 @@ const DWORD IrqlMasks[] = {
 	0x00000000, // IRQL 30
 	0x00000000, // IRQL 31 (HIGH_LEVEL)
 };
-
 
 // ******************************************************************
 // * 0x0033 - InterlockedCompareExchange()
@@ -403,7 +374,7 @@ XBSYSAPI EXPORTNUM(160) xbox::KIRQL FASTCALL xbox::KfRaiseIrql
 	LOG_FUNC_ONE_ARG_TYPE(KIRQL_TYPE, NewIrql);
 
 	// Inlined KeGetCurrentIrql() :
-	PKPCR Pcr = EmuKeGetPcr();
+	PKPCR Pcr = KeGetPcr();
 	KIRQL OldIrql = (KIRQL)Pcr->Irql;
 
 	// Set new before check
@@ -431,7 +402,7 @@ XBSYSAPI EXPORTNUM(161) xbox::void_xt FASTCALL xbox::KfLowerIrql
 {
 	LOG_FUNC_ONE_ARG_TYPE(KIRQL_TYPE, NewIrql);
 
-	KPCR* Pcr = EmuKeGetPcr();
+	KPCR* Pcr = KeGetPcr();
 
 	if (g_bIsDebugKernel && NewIrql > Pcr->Irql) {
 		KIRQL OldIrql = Pcr->Irql;
@@ -479,24 +450,12 @@ XBSYSAPI EXPORTNUM(163) xbox::void_xt FASTCALL xbox::KiUnlockDispatcherDatabase
 {
 	LOG_FUNC_ONE_ARG_TYPE(KIRQL_TYPE, OldIrql);
 
-	// Wrong, this should only happen when OldIrql >= DISPATCH_LEVEL
-	// Checking DpcRoutineActive doesn't work because our Prcb is per-thread instead of being per-processor
-	if (!IsDpcActive()) { // Avoid KeIsExecutingDpc(), as that logs
+	if (!(KeGetCurrentPrcb()->DpcRoutineActive)) // Avoid KeIsExecutingDpc(), as that logs
 		HalRequestSoftwareInterrupt(DISPATCH_LEVEL);
-	}
-
-	if (OldIrql < DISPATCH_LEVEL) {
-		// FIXME: this is wrong, it should perform a thread switch and check the kthread of the new selected thread for pending APCs.
-		// We can't perform our own threads switching now, so we will just check the current thread
-
-		if (KeGetCurrentThread()->ApcState.KernelApcPending) {
-			KiExecuteKernelApc();
-		}
-	}
-
-	KfLowerIrql(OldIrql);
 
 	LOG_INCOMPLETE(); // TODO : Thread-switch?
+
+	KfLowerIrql(OldIrql);
 }
 
 // ******************************************************************
