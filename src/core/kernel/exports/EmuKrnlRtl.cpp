@@ -40,7 +40,7 @@ namespace NtDll
 	#include "core\kernel\support\EmuNtDll.h"
 };
 
-#include "core\kernel\init\CxbxKrnl.h" // For CxbxrKrnlAbort()
+#include "core\kernel\init\CxbxKrnl.h" // For CxbxrAbort()
 #include "core\kernel\support\Emu.h" // For EmuLog(LOG_LEVEL::WARNING, )
 #include <assert.h>
 
@@ -50,32 +50,48 @@ namespace NtDll
 #undef RtlFillMemory
 #undef RtlMoveMemory
 #undef RtlZeroMemory
-#undef EXCEPTION_NONCONTINUABLE
-#undef EXCEPTION_UNWINDING
-#undef EXCEPTION_EXIT_UNWIND
-#undef EXCEPTION_STACK_INVALID
-#undef EXCEPTION_NESTED_CALL
-#undef EXCEPTION_TARGET_UNWIND
-#undef EXCEPTION_COLLIDED_UNWIND
-#undef EXCEPTION_UNWIND
 
 #endif // _WIN32
-
-// Exception record flags
-// Source: ReactOS
-// NOTE: don't put these in xboxkrnl.h, they will conflict with the macros provided by Windows
-#define EXCEPTION_NONCONTINUABLE  0x01
-#define EXCEPTION_UNWINDING       0x02
-#define EXCEPTION_EXIT_UNWIND     0x04
-#define EXCEPTION_STACK_INVALID   0x08
-#define EXCEPTION_NESTED_CALL     0x10
-#define EXCEPTION_TARGET_UNWIND   0x20
-#define EXCEPTION_COLLIDED_UNWIND 0x40
-#define EXCEPTION_UNWIND (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND | EXCEPTION_TARGET_UNWIND | EXCEPTION_COLLIDED_UNWIND)
 
 xbox::dword_xt WINAPI RtlAnsiStringToUnicodeSize(const xbox::STRING *str)
 {
 	return (str->Length + sizeof(ANSI_NULL)) * sizeof(WCHAR);
+}
+
+// Source: ReactOS (excluded DPC stack check)
+xbox::boolean_xt RtlpCaptureStackLimits(
+	IN xbox::ulong_ptr_xt Ebp,
+	OUT xbox::ulong_ptr_xt* StackBegin,
+	OUT xbox::ulong_ptr_xt* StackEnd)
+{
+	using namespace xbox;
+	PKTHREAD Thread = KeGetCurrentThread();
+
+	/* Don't even try at ISR level or later */
+	//if (KeGetCurrentIrql() > DISPATCH_LEVEL) return FALSE;
+
+	/* Start with defaults */
+	*StackBegin = reinterpret_cast<ulong_ptr_xt>(Thread->StackLimit);
+	*StackEnd = reinterpret_cast<ulong_ptr_xt>(Thread->StackBase);
+
+	/* Check if EBP is inside the stack */
+	if ((*StackBegin <= Ebp) && (Ebp <= *StackEnd)) {
+		/* Then make the stack start at EBP */
+		*StackBegin = Ebp;
+	}
+	else {
+		/* We're somewhere else entirely... use EBP for safety */
+		*StackBegin = Ebp;
+		*StackEnd = PAGE_ALIGN(*StackBegin);
+	}
+
+	/* Return success */
+	return TRUE;
+}
+
+xbox::void_xt xbox::RtlInitSystem()
+{
+	xbox::RtlInitializeCriticalSection(&NtSystemTimeCritSec);
 }
 
 // ******************************************************************
@@ -97,23 +113,28 @@ XBSYSAPI EXPORTNUM(260) xbox::ntstatus_xt NTAPI xbox::RtlAnsiStringToUnicodeStri
 	dword_xt total = RtlAnsiStringToUnicodeSize(SourceString);
 
 	if (total > 0xffff) {
-		return X_STATUS_INVALID_PARAMETER_2;
+		RETURN(X_STATUS_INVALID_PARAMETER_2);
 	}
 
 	DestinationString->Length = (USHORT)(total - sizeof(WCHAR));
 	if (AllocateDestinationString) {
 		DestinationString->MaximumLength = (USHORT)total;
-		if (!(DestinationString->Buffer = (USHORT*)ExAllocatePoolWithTag(total, 'grtS'))) {
-			return X_STATUS_NO_MEMORY;
+		if (!(DestinationString->Buffer = (wchar_xt*)ExAllocatePoolWithTag(total, 'grtS'))) {
+			RETURN(X_STATUS_NO_MEMORY);
 		}
 	}
 	else {
 		if (total > DestinationString->MaximumLength) {
-			return X_STATUS_BUFFER_OVERFLOW;
+			RETURN(X_STATUS_BUFFER_OVERFLOW);
 		}
 	}
 
-	RtlMultiByteToUnicodeN((PWSTR)DestinationString->Buffer, (ULONG)DestinationString->Length, NULL, SourceString->Buffer, SourceString->Length);
+	RtlMultiByteToUnicodeN((PWSTR)DestinationString->Buffer,
+	                       (ULONG)DestinationString->Length,
+	                       NULL,
+	                       SourceString->Buffer,
+	                       SourceString->Length);
+
 	DestinationString->Buffer[DestinationString->Length / sizeof(WCHAR)] = 0;
 
 	RETURN(X_STATUS_SUCCESS);
@@ -257,7 +278,7 @@ XBSYSAPI EXPORTNUM(265) xbox::void_xt NTAPI xbox::RtlCaptureContext
 		mov ebx, [esp + 8]           // ebx = ContextRecord;
 
 		mov [ebx + CONTEXT.Eax], eax // ContextRecord->Eax = eax;
-		mov eax, [esp]				 // eax = original value of ebx
+		mov eax, [esp]               // eax = original value of ebx
 		mov [ebx + CONTEXT.Ebx], eax // ContextRecord->Ebx = original value of ebx
 		mov [ebx + CONTEXT.Ecx], ecx // ContextRecord->Ecx = ecx;
 		mov [ebx + CONTEXT.Edx], edx // ContextRecord->Edx = edx;
@@ -283,6 +304,7 @@ XBSYSAPI EXPORTNUM(265) xbox::void_xt NTAPI xbox::RtlCaptureContext
 // ******************************************************************
 // * 0x010A - RtlCaptureStackBackTrace()
 // ******************************************************************
+// Source: ReactOS
 XBSYSAPI EXPORTNUM(266) xbox::ushort_xt NTAPI xbox::RtlCaptureStackBackTrace
 (
 	IN ulong_xt FramesToSkip,
@@ -298,9 +320,48 @@ XBSYSAPI EXPORTNUM(266) xbox::ushort_xt NTAPI xbox::RtlCaptureStackBackTrace
 		LOG_FUNC_ARG_OUT(BackTraceHash)
 	LOG_FUNC_END;
 
-	LOG_UNIMPLEMENTED();
+	PVOID Frames[2 * 64];
+	ulong_xt FrameCount;
+	ulong_xt Hash = 0;
+	ushort_xt i;
 
-	RETURN(NULL);
+	/* Skip a frame for the caller */
+	FramesToSkip++;
+
+	/* Don't go past the limit */
+	if ((FramesToCapture + FramesToSkip) >= 128) {
+		return 0;
+	}
+
+	/* Do the back trace */
+	FrameCount = RtlWalkFrameChain(Frames, FramesToCapture + FramesToSkip, 0);
+
+	/* Make sure we're not skipping all of them */
+	if (FrameCount <= FramesToSkip) {
+		return 0;
+	}
+
+	/* Loop all the frames */
+	for (i = 0; i < FramesToCapture; i++) {
+		/* Don't go past the limit */
+		if ((FramesToSkip + i) >= FrameCount) {
+			break;
+		}
+
+		/* Save this entry and hash it */
+		BackTrace[i] = Frames[FramesToSkip + i];
+		Hash += reinterpret_cast<ulong_xt>(BackTrace[i]);
+	}
+
+	/* Write the hash */
+	if (BackTraceHash) {
+		*BackTraceHash = Hash;
+	}
+
+	/* Clear the other entries and return count */
+	RtlFillMemoryUlong(Frames, 128, 0);
+
+	RETURN(i);
 }
 
 // ******************************************************************
@@ -470,23 +531,31 @@ XBSYSAPI EXPORTNUM(270) xbox::long_xt NTAPI xbox::RtlCompareString
 		LOG_FUNC_ARG(CaseInSensitive)
 		LOG_FUNC_END;
 
-	LONG result;
+	const USHORT l1 = String1->Length;
+	const USHORT l2 = String2->Length;
+	const USHORT maxLen = (l1 <= l2 ? l1 : l2);
 
-	USHORT l1 = String1->Length;
-	USHORT l2 = String2->Length;
-	USHORT maxLen = l1 <= l2 ? l1 : l2;
-
-	CHAR *str1 = String1->Buffer;
-	CHAR *str2 = String2->Buffer;
+	const PCHAR str1 = String1->Buffer;
+	const PCHAR str2 = String2->Buffer;
 
 	if (CaseInSensitive) {
-		result = _strnicmp(str1, str2, maxLen);
+		for (unsigned i = 0; i < maxLen; i++) {
+			UCHAR char1 = RtlLowerChar(str1[i]);
+			UCHAR char2 = RtlLowerChar(str2[i]);
+			if (char1 != char2) {
+				RETURN(char1 - char2);
+			}
+		}
 	}
 	else {
-		result = strncmp(str1, str2, maxLen);
+		for (unsigned i = 0; i < maxLen; i++) {
+			if (str1[i] != str2[i]) {
+				RETURN(str1[i] - str2[i]);
+			}
+		}
 	}
 
-	RETURN(result);
+	RETURN(l1 - l2);
 }
 
 // ******************************************************************
@@ -505,23 +574,32 @@ XBSYSAPI EXPORTNUM(271) xbox::long_xt NTAPI xbox::RtlCompareUnicodeString
 		LOG_FUNC_ARG(CaseInSensitive)
 		LOG_FUNC_END;
 
-	LONG result;
+	const USHORT l1 = String1->Length;
+	const USHORT l2 = String2->Length;
+	const USHORT maxLen = (l1 <= l2 ? l1 : l2) / sizeof(WCHAR);
 
-	USHORT l1 = String1->Length;
-	USHORT l2 = String2->Length;
-	USHORT maxLen = l1 <= l2 ? l1 : l2;
-
-	WCHAR *str1 = (WCHAR*)(String1->Buffer);
-	WCHAR *str2 = (WCHAR*)(String2->Buffer);
+	const wchar_xt* str1 = String1->Buffer;
+	const wchar_xt* str2 = String2->Buffer;
 
 	if (CaseInSensitive) {
-		result = _wcsnicmp(str1, str2, maxLen);
+		for (unsigned i = 0; i < maxLen; i++) {
+			wchar_xt char1 = towlower(str1[i]);
+			wchar_xt char2 = towlower(str2[i]);
+
+			if (char1 != char2) {
+				RETURN(char1 - char2);
+			}
+		}
 	}
 	else {
-		result = wcsncmp(str1, str2, maxLen);
+		for (unsigned i = 0; i < maxLen; i++) {
+			if (str1[i] != str2[i]) {
+				RETURN(str1[i] - str2[i]);
+			}
+		}
 	}
 
-	RETURN(result);
+	RETURN(l1 - l2);
 }
 
 // ******************************************************************
@@ -601,7 +679,7 @@ XBSYSAPI EXPORTNUM(274) xbox::boolean_xt NTAPI xbox::RtlCreateUnicodeString
 	BOOLEAN result = TRUE;
 
 	ULONG bufferSize = (std::u16string(SourceString).length() + 1) * sizeof(WCHAR);
-	DestinationString->Buffer = (USHORT *)ExAllocatePoolWithTag(bufferSize, 'grtS');
+	DestinationString->Buffer = (wchar_xt*)ExAllocatePoolWithTag(bufferSize, 'grtS');
 	if (!DestinationString->Buffer) {
 		result = FALSE;
 	}
@@ -649,7 +727,7 @@ XBSYSAPI EXPORTNUM(276) xbox::ntstatus_xt NTAPI xbox::RtlDowncaseUnicodeString
 
 	if (AllocateDestinationString) {
 		DestinationString->MaximumLength = SourceString->Length;
-		DestinationString->Buffer = (USHORT*)ExAllocatePoolWithTag((ULONG)DestinationString->MaximumLength, 'grtS');
+		DestinationString->Buffer = (wchar_xt*)ExAllocatePoolWithTag((ULONG)DestinationString->MaximumLength, 'grtS');
 		if (DestinationString->Buffer == NULL) {
 			return X_STATUS_NO_MEMORY;
 		}
@@ -701,7 +779,7 @@ XBSYSAPI EXPORTNUM(277) xbox::void_xt NTAPI xbox::RtlEnterCriticalSection
 				);
 				if (!X_NT_SUCCESS(result))
 				{
-					CxbxrKrnlAbort("Waiting for event of a critical section returned %lx.", result);
+					CxbxrAbort("Waiting for event of a critical section returned %lx.", result);
 				};
 			}
             CriticalSection->OwningThread = thread;
@@ -1055,7 +1133,31 @@ XBSYSAPI EXPORTNUM(288) xbox::void_xt NTAPI xbox::RtlGetCallersAddress
 		LOG_FUNC_ARG_OUT(CallersCaller)
 	LOG_FUNC_END;
 
-	LOG_UNIMPLEMENTED();
+	/* Get the tow back trace address */
+	PVOID BackTrace[2];
+	ushort_xt FrameCount = RtlCaptureStackBackTrace(2, 2, &BackTrace[0], zeroptr);
+
+	/* Only if user want it */
+	if (CallersAddress != NULL) {
+		/* only when first frames exist */
+		if (FrameCount >= 1) {
+			*CallersAddress = BackTrace[0];
+		}
+		else {
+			*CallersAddress = zeroptr;
+		}
+	}
+
+	/* Only if user want it */
+	if (CallersCaller != NULL) {
+		/* only when second frames exist */
+		if (FrameCount >= 2) {
+			*CallersCaller = BackTrace[1];
+		}
+		else {
+			*CallersCaller = zeroptr;
+		}
+	}
 }
 
 // ******************************************************************
@@ -1098,9 +1200,8 @@ XBSYSAPI EXPORTNUM(290) xbox::void_xt NTAPI xbox::RtlInitUnicodeString
 		LOG_FUNC_ARG(SourceString)
 		LOG_FUNC_END;
 
-	DestinationString->Buffer = (USHORT*)SourceString;
+	DestinationString->Buffer = (wchar_xt*)SourceString;
 	if (SourceString != NULL) {
-		DestinationString->Buffer = (USHORT*)SourceString;
 		DestinationString->Length = (USHORT)std::u16string(SourceString).length() * 2;
 		DestinationString->MaximumLength = DestinationString->Length + 2;
 	}
@@ -1448,6 +1549,7 @@ no_mapping:
 
 #define TICKSPERSEC        10000000
 #define TICKSPERMSEC       10000
+#define MSECSPERSEC        1000
 #define SECSPERDAY         86400
 #define SECSPERHOUR        3600
 #define SECSPERMIN         60
@@ -1465,6 +1567,11 @@ no_mapping:
 /* 1601 to 1980 is 379 years plus 91 leap days */
 #define SECS_1601_TO_1980  ((379 * 365 + 91) * (ULONGLONG)SECSPERDAY)
 #define TICKS_1601_TO_1980 (SECS_1601_TO_1980 * TICKSPERSEC)
+
+const xbox::LARGE_INTEGER Magic10000 = { .QuadPart = 0xd1b71758e219652ci64 };
+#define SHIFT10000 13
+xbox::LARGE_INTEGER Magic86400000 = { .QuadPart = 0xc6d750ebfa67b90ei64 };
+#define SHIFT86400000 26
 
 
 static const int MonthLengths[2][MONSPERYEAR] =
@@ -1503,7 +1610,7 @@ XBSYSAPI EXPORTNUM(303) xbox::void_xt NTAPI xbox::RtlRaiseStatus
 
 	EXCEPTION_RECORD record;
 	record.ExceptionCode = Status;
-	record.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
+	record.ExceptionFlags = X_EXCEPTION_NONCONTINUABLE;
 	record.ExceptionRecord = NULL;
 	record.NumberParameters = 0;
 
@@ -1519,26 +1626,31 @@ XBSYSAPI EXPORTNUM(304) xbox::boolean_xt NTAPI xbox::RtlTimeFieldsToTime
 	OUT PLARGE_INTEGER  Time
 )
 {
-	LOG_FUNC_BEGIN
-		LOG_FUNC_ARG(TimeFields)
-		LOG_FUNC_ARG_OUT(Time)
-		LOG_FUNC_END;
-
 	int month, year, cleaps, day;
 
-	/* FIXME: normalize the TIME_FIELDS structure here */
-	/* No, native just returns 0 (error) if the fields are not */
-	if (TimeFields->Millisecond < 0 || TimeFields->Millisecond > 999 ||
-		TimeFields->Second < 0 || TimeFields->Second > 59 ||
-		TimeFields->Minute < 0 || TimeFields->Minute > 59 ||
-		TimeFields->Hour < 0 || TimeFields->Hour > 23 ||
-		TimeFields->Month < 1 || TimeFields->Month > 12 ||
-		TimeFields->Day < 1 ||
-		TimeFields->Day > MonthLengths
-			[TimeFields->Month == 2 || IsLeapYear(TimeFields->Year)]
-			[TimeFields->Month - 1] ||
-		TimeFields->Year < 1601)
+	/* Verify each TimeFields' variables are within range */
+	if (TimeFields->Millisecond < 0 || TimeFields->Millisecond > 999) {
 		return FALSE;
+	}
+	if (TimeFields->Second < 0 || TimeFields->Second > 59) {
+		return FALSE;
+	}
+	if (TimeFields->Minute < 0 || TimeFields->Minute > 59) {
+		return FALSE;
+	}
+	if (TimeFields->Hour < 0 || TimeFields->Hour > 23) {
+		return FALSE;
+	}
+	if (TimeFields->Month < 1 || TimeFields->Month > 12) {
+		return FALSE;
+	}
+	if (TimeFields->Day < 1 ||
+		TimeFields->Day > MonthLengths[IsLeapYear(TimeFields->Year)][TimeFields->Month - 1]) {
+		return FALSE;
+	}
+	if (TimeFields->Year < 1601) {
+		return FALSE;
+	}
 
 	/* now calculate a day count from the date
 	* First start counting years from March. This way the leap days
@@ -1554,20 +1666,21 @@ XBSYSAPI EXPORTNUM(304) xbox::boolean_xt NTAPI xbox::RtlTimeFieldsToTime
 		month = TimeFields->Month + 1;
 		year = TimeFields->Year;
 	}
-	cleaps = (3 * (year / 100) + 3) / 4;   /* nr of "century leap years"*/
-	day = (36525 * year) / 100 - cleaps + /* year * dayperyr, corrected */
-			(1959 * month) / 64 +         /* months * daypermonth */
-			TimeFields->Day -				/* day of the month */
-			584817;							/* zero that on 1601-01-01 */
+	cleaps = (3 * (year / 100) + 3) / 4;  /* nr of "century leap years"*/
+	day = (36525 * year) / 100 - cleaps + /* year * DayPerYear, corrected */
+	      (1959 * month) / 64 +           /* months * DayPerMonth */
+	      TimeFields->Day -               /* day of the month */
+	      584817;                         /* zero that on 1601-01-01 */
 	/* done */
 
-	Time->QuadPart = (((((LONGLONG)day * HOURSPERDAY +
-		TimeFields->Hour) * MINSPERHOUR +
-		TimeFields->Minute) * SECSPERMIN +
-		TimeFields->Second) * 1000 +
-		TimeFields->Millisecond) * TICKSPERMSEC;
+	/* Convert into Time format */
+	Time->QuadPart = day * HOURSPERDAY;
+	Time->QuadPart = (Time->QuadPart + TimeFields->Hour) * MINSPERHOUR;
+	Time->QuadPart = (Time->QuadPart + TimeFields->Minute) * SECSPERMIN;
+	Time->QuadPart = (Time->QuadPart + TimeFields->Second) * MSECSPERSEC;
+	Time->QuadPart = (Time->QuadPart + TimeFields->Millisecond) * TICKSPERMSEC;
 
-	RETURN(TRUE);
+	return TRUE;
 }
 
 // ******************************************************************
@@ -1579,36 +1692,27 @@ XBSYSAPI EXPORTNUM(305) xbox::void_xt NTAPI xbox::RtlTimeToTimeFields
 	OUT PTIME_FIELDS    TimeFields
 )
 {
-	LOG_FUNC_BEGIN
-		LOG_FUNC_ARG(Time)
-		LOG_FUNC_ARG_OUT(TimeFields)
-		LOG_FUNC_END;
+	LONGLONG Days, cleaps, years, yearday, months;
 
-	int SecondsInDay;
-	long int cleaps, years, yearday, months;
-	long int Days;
-	LONGLONG _Time;
-
-	/* Extract millisecond from time and convert time into seconds */
-	TimeFields->Millisecond =
-		(cshort_xt)((Time->QuadPart % TICKSPERSEC) / TICKSPERMSEC);
-	_Time = Time->QuadPart / TICKSPERSEC;
-
-	/* The native version of RtlTimeToTimeFields does not take leap seconds
-	* into account */
-
-	/* Split the time into days and seconds within the day */
-	Days = (long int )(_Time / SECSPERDAY);
-	SecondsInDay = _Time % SECSPERDAY;
+	/* Extract milliseconds from time and days from milliseconds */
+	// NOTE: Reverse engineered native kernel uses RtlExtendedMagicDivide calls.
+	// Using similar code of ReactOS does not emulate native kernel's implement for
+	// one increment over large integer's max value.
+	xbox::LARGE_INTEGER MillisecondsTotal = RtlExtendedMagicDivide(*Time, Magic10000, SHIFT10000);
+	Days = RtlExtendedMagicDivide(MillisecondsTotal, Magic86400000, SHIFT86400000).u.LowPart;
+	MillisecondsTotal.QuadPart -= Days * SECSPERDAY * MSECSPERSEC;
 
 	/* compute time of day */
-	TimeFields->Hour = (cshort_xt)(SecondsInDay / SECSPERHOUR);
-	SecondsInDay = SecondsInDay % SECSPERHOUR;
-	TimeFields->Minute = (cshort_xt)(SecondsInDay / SECSPERMIN);
-	TimeFields->Second = (cshort_xt)(SecondsInDay % SECSPERMIN);
+	TimeFields->Millisecond = MillisecondsTotal.u.LowPart % MSECSPERSEC;
+	dword_xt RemainderTime = MillisecondsTotal.u.LowPart / MSECSPERSEC;
+	TimeFields->Second = RemainderTime % SECSPERMIN;
+	RemainderTime /= SECSPERMIN;
+	TimeFields->Minute = RemainderTime % MINSPERHOUR;
+	RemainderTime /= MINSPERHOUR;
+	TimeFields->Hour = RemainderTime; // NOTE: Remaining hours did not received 24 hours modulo treatment.
 
 	/* compute day of week */
-	TimeFields->Weekday = (cshort_xt)((EPOCHWEEKDAY + Days) % DAYSPERWEEK);
+	TimeFields->Weekday = (EPOCHWEEKDAY + Days) % DAYSPERWEEK;
 
 	/* compute year, month and day of month. */
 	cleaps = (3 * ((4 * Days + 1227) / DAYSPERQUADRICENTENNIUM) + 3) / 4;
@@ -1617,7 +1721,7 @@ XBSYSAPI EXPORTNUM(305) xbox::void_xt NTAPI xbox::RtlTimeToTimeFields
 	yearday = Days - (years * DAYSPERNORMALQUADRENNIUM) / 4;
 	months = (64 * yearday) / 1959;
 	/* the result is based on a year starting on March.
-	* To convert take 12 from Januari and Februari and
+	* To convert take 12 from January and February and
 	* increase the year by one. */
 	if (months < 14) {
 		TimeFields->Month = (USHORT)(months - 1);
@@ -1699,8 +1803,9 @@ XBSYSAPI EXPORTNUM(308) xbox::ntstatus_xt NTAPI xbox::RtlUnicodeStringToAnsiStri
 		LOG_FUNC_ARG(AllocateDestinationString)
 		LOG_FUNC_END;
 
-	ntstatus_xt ret = X_STATUS_SUCCESS;
+	ntstatus_xt result, ret = X_STATUS_SUCCESS;
 	dword_xt AnsiMaxLength = RtlUnicodeStringToAnsiSize(SourceString);
+	xbox::ulong_xt index = 0;
 
 	DestinationString->Length = (ushort_xt)(AnsiMaxLength - 1);
 	if (AllocateDestinationString) {
@@ -1720,8 +1825,7 @@ XBSYSAPI EXPORTNUM(308) xbox::ntstatus_xt NTAPI xbox::RtlUnicodeStringToAnsiStri
 		DestinationString->Length = DestinationString->MaximumLength - 1;
 	}
 
-	xbox::ulong_xt index = 0;
-	ntstatus_xt result = RtlUnicodeToMultiByteN(DestinationString->Buffer, DestinationString->Length, &index, (PWSTR)SourceString->Buffer, SourceString->Length);
+	result = RtlUnicodeToMultiByteN(DestinationString->Buffer, DestinationString->Length, &index, (PWSTR)SourceString->Buffer, SourceString->Length);
 
 	if (X_NT_SUCCESS(result)) {
 		DestinationString->Buffer[index] = 0;
@@ -1950,7 +2054,7 @@ XBSYSAPI EXPORTNUM(314) xbox::ntstatus_xt NTAPI xbox::RtlUpcaseUnicodeString
 
 	if (AllocateDestinationString) {
 		DestinationString->MaximumLength = SourceString->Length;
-		DestinationString->Buffer = (USHORT*)ExAllocatePoolWithTag((ULONG)DestinationString->MaximumLength, 'grtS');
+		DestinationString->Buffer = (wchar_xt*)ExAllocatePoolWithTag((ULONG)DestinationString->MaximumLength, 'grtS');
 		if (DestinationString->Buffer == NULL) {
 			return X_STATUS_NO_MEMORY;
 		}
@@ -2091,6 +2195,8 @@ XBSYSAPI EXPORTNUM(318) xbox::ushort_xt FASTCALL xbox::RtlUshortByteSwap
 // ******************************************************************
 // * 0x013F - RtlWalkFrameChain()
 // ******************************************************************
+// Source: ReactOS (modified to fit in xbox compatibility layer)
+// NOTE: From xbox kernel, Flags input is not used.
 XBSYSAPI EXPORTNUM(319) xbox::ulong_xt NTAPI xbox::RtlWalkFrameChain
 (
 	OUT PVOID *Callers,
@@ -2098,15 +2204,102 @@ XBSYSAPI EXPORTNUM(319) xbox::ulong_xt NTAPI xbox::RtlWalkFrameChain
 	IN ulong_xt Flags
 )
 {
+	ulong_ptr_xt Stack;
+	/* Get current EBP */
+#if defined __GNUC__
+	__asm__("mov %%ebp, %0" : "=r" (Stack) : );
+#elif defined(_MSC_VER)
+	__asm mov Stack, ebp
+#endif
+
+#if 0 // NOTE: Disabled due to __try/__except doesn't like this for some reason.
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG_OUT(Callers)
 		LOG_FUNC_ARG(Count)
 		LOG_FUNC_ARG(Flags)
 	LOG_FUNC_END;
+#endif
 
-	LOG_UNIMPLEMENTED();
+	/* Get the actual safe limits */
+	ulong_ptr_xt StackBegin, StackEnd;
+	RtlpCaptureStackLimits(Stack, &StackBegin, &StackEnd);
 
-	RETURN(NULL);
+	ulong_xt i = 0;
+
+	/* Use a SEH block for maximum protection */
+	__try {
+		/* Loop the frames */
+		boolean_xt StopSearch = FALSE;
+		for (i = 0; i < Count; i++) {
+			/*
+			 * Leave if we're past the stack,
+			 * if we're before the stack,
+			 * or if we've reached ourselves.
+			 */
+			if ((Stack >= StackEnd) ||
+				(!i ? (Stack < StackBegin) : (Stack <= StackBegin)) ||
+				((StackEnd - Stack) < (2 * sizeof(ulong_ptr_xt))))
+			{
+				/* We're done or hit a bad address */
+				break;
+			}
+
+			/* Get new stack and EIP */
+			ulong_ptr_xt NewStack = *(ulong_ptr_xt*)Stack;
+			ulong_xt Eip = *(ulong_ptr_xt*)(Stack + sizeof(ulong_ptr_xt));
+
+			/* Check if Eip is not below executable's dos header */
+			if (Eip < KiB(64)) {
+				break;
+			}
+
+			/* Check if the new pointer is above the old one and past the end */
+			if (!((Stack < NewStack) && (NewStack < StackEnd))) {
+				/* Stop searching after this entry */
+				StopSearch = TRUE;
+			}
+
+			/* Also make sure that the EIP isn't a stack address */
+			if ((StackBegin < Eip) && (Eip < StackEnd)) {
+				break;
+			}
+
+			/* Save this frame */
+			Callers[i] = reinterpret_cast<PVOID>(Eip);
+
+			/* Check if we should continue */
+			if (StopSearch)
+			{
+				/* Return the next index */
+				i++;
+				break;
+			}
+
+			/* Move to the next stack */
+			Stack = NewStack;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		/* No index */
+		i = 0;
+	}
+
+#ifndef ENABLE_KTHREAD_SWITCHING
+	// HACK: This is necessary to exclude our own PCSTProxy startup function.
+	if (i) {
+		ulong_xt Eip = reinterpret_cast<ulong_xt>(Callers[i - 1]);
+		// Check if the first call is outside of xbe's system memory.
+		// If so, force exclude it to conform with xbox kernel test suite's result.
+		// NOTE: This will always occur every time. As the thread's startup function address reside behind KSWITCHFRAME structure.
+		//       Except we are currently using our host's local variable as xbox's stack storage.
+		if (Eip > g_SystemMaxMemory) {
+			i--;
+			Callers[i] = zeroptr;
+		}
+	}
+#endif
+
+	return i;// RETURN(i);
 }
 
 // ******************************************************************
