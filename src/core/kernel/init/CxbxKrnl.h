@@ -26,6 +26,7 @@
 #define CXBXKRNL_H
 
 #include "Cxbx.h"
+#include "common/cxbxr.hpp"
 #include "common\AddressRanges.h"
 #include "common/ReserveAddressRanges.h"
 #include "common\xbe\Xbe.h"
@@ -139,29 +140,8 @@ extern Xbe::Certificate *g_pCertificate;
 
 extern bool g_bIsDebugKernel;
 
-bool CreateSettings();
-
-bool HandleFirstLaunch();
-
 /*! Cxbx Kernel Entry Point */
 void CxbxKrnlEmulate(unsigned int system, blocks_reserved_t blocks_reserved);
-
-/*! cleanup emulation */
-[[noreturn]] void CxbxrKrnlAbortEx(CXBXR_MODULE cxbxr_module, const char *szErrorMessage, ...);
-
-#define CxbxrKrnlAbort(fmt, ...) CxbxrKrnlAbortEx(LOG_PREFIX, fmt, ##__VA_ARGS__)
-
-/*! register a thread handle */
-void CxbxKrnlRegisterThread(HANDLE hThread);
-
-/*! suspend emulation */
-void CxbxKrnlSuspend();
-
-/*! resume emulation */
-void CxbxKrnlResume();
-
-/*! terminate gracefully the emulation */
-void CxbxKrnlShutDown(bool is_reboot = false);
 
 /*! display the fatal error message*/
 void CxbxKrnlPrintUEM(ULONG ErrorCode);
@@ -169,20 +149,15 @@ void CxbxKrnlPrintUEM(ULONG ErrorCode);
 /*! display the cause of the fatal error message*/
 void CxbxPrintUEMInfo(ULONG ErrorCode);
 
-/*! terminate the calling thread */
-[[noreturn]] void CxbxKrnlTerminateThread();
-
 /*! kernel panic (trap for unimplemented kernel functions) */
 void CxbxKrnlPanic();
 
 /*! empty function */
 void CxbxKrnlNoFunc();
 
-void CxbxInitPerformanceCounters(); // Implemented in EmuKrnlKe.cpp
-
-void CxbxrInitFilePaths();
-
-bool CxbxIsElevated();
+void InitDpcData(); // Implemented in EmuKrnlKe.cpp
+bool IsDpcActive();
+void ExecuteDpcQueue();
 
 /*! kernel thunk table */
 extern uint32_t CxbxKrnl_KernelThunkTable[379];
@@ -192,8 +167,6 @@ extern bool g_CxbxPrintUEM;
 extern ULONG g_CxbxFatalErrorCode;
 
 extern size_t g_SystemMaxMemory;
-
-void InitXboxThread();
 
 /*! thread local storage structure */
 extern Xbe::TLS *CxbxKrnl_TLS;
@@ -210,16 +183,11 @@ extern Xbe *CxbxKrnl_Xbe;
 extern HWND CxbxKrnl_hEmuParent;
 
 /*! file paths */
-extern char szFilePath_CxbxReloaded_Exe[MAX_PATH];
-extern std::string g_DataFilePath;
-extern char szFilePath_EEPROM_bin[MAX_PATH];
 extern char szFilePath_Xbe[xbox::max_path*2];
 
 #ifdef __cplusplus
 }
 #endif
-
-std::optional<std::string> CxbxExec(bool useDebugger, HANDLE *hProcess, bool requestHandleProcess);
 
 // Returns the last Win32 error, in string format. Returns an empty string if there is no error.
 extern std::string CxbxGetLastErrorString(char * lpszFunction);
