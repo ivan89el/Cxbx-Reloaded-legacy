@@ -19,6 +19,8 @@ namespace xbox
 
 #define NtCurrentThread() ((HANDLE)-2)
 
+#define X_MAXIMUM_WAIT_OBJECTS 64
+
 // ******************************************************************
 // * NtAllocateVirtualMemory
 // ******************************************************************
@@ -170,9 +172,9 @@ XBSYSAPI EXPORTNUM(196) ntstatus_xt NTAPI NtDeviceIoControlFile
 // ******************************************************************
 XBSYSAPI EXPORTNUM(197) ntstatus_xt NTAPI NtDuplicateObject
 (
-    PVOID   SourceHandle,
-    PVOID  *TargetHandle,
-    dword_xt   Options
+    HANDLE   SourceHandle,
+    PHANDLE  TargetHandle,
+    dword_xt Options
 );
 
 // ******************************************************************
@@ -261,7 +263,7 @@ XBSYSAPI EXPORTNUM(206) ntstatus_xt NTAPI NtQueueApcThread
 	IN PIO_APC_ROUTINE      ApcRoutine,
 	IN PVOID                ApcRoutineContext OPTIONAL,
 	IN PIO_STATUS_BLOCK     ApcStatusBlock OPTIONAL,
-	IN ulong_xt                ApcReserved OPTIONAL 
+	IN PVOID                ApcReserved OPTIONAL
 );
 
 // ******************************************************************
@@ -308,7 +310,7 @@ XBSYSAPI EXPORTNUM(209) ntstatus_xt NTAPI NtQueryEvent
 XBSYSAPI EXPORTNUM(210) ntstatus_xt NTAPI NtQueryFullAttributesFile
 (
 	IN  POBJECT_ATTRIBUTES          ObjectAttributes,
-	OUT PFILE_NETWORK_OPEN_INFORMATION  Attributes
+	OUT PFILE_NETWORK_OPEN_INFORMATION  FileInformation
 );
 
 // ******************************************************************
