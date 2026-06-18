@@ -29,24 +29,13 @@
 #include "common\xbe\Xbe.h"
 #include <windows.h>
 
-// Get Xbox's TIB StackBase address from thread's StackBase.
-xbox::PVOID EmuGetTIBStackBase(xbox::PVOID ThreadStackBase);
-
-// generate stack size reserved for xbox threads to write on.
-// espBaseAddress will return aligned DOWN address, do not rely on return's size for offset usage.
-xbox::dword_xt EmuGenerateStackSize(xbox::addr_xt& espBaseAddress, IN xbox::ulong_xt TlsDataSize);
-
 // initialize fs segment selector emulation
 extern void EmuInitFS();
 
 // generate fs segment selector
-template<bool IsHostThread = false>
-void EmuGenerateFS(xbox::PETHREAD Ethread, unsigned XboxThreadStackBaseReserved = 0, unsigned XboxThreadStackSizeReserved = 0);
-// free kpcr allocated for the thread
+extern void EmuGenerateFS(Xbe::TLS *pTLS, void *pTLSData);
+// free resources allocated for the thread
 void EmuKeFreePcr();
-
-void EmuKeSetPcr(xbox::KPCR *Pcr);
-xbox::KPCR *_stdcall EmuKeGetPcr();
 
 typedef struct
 {

@@ -31,9 +31,7 @@
 #include <core\kernel\exports\xboxkrnl.h>
 #include "core\kernel\exports\EmuKrnl.h" // For InitializeListHead(), etc.
 #include "core\kernel\exports\EmuKrnlKe.h"
-#include "core\kernel\exports\EmuKrnlKi.h"
 #include "core\kernel\support\EmuFS.h" // For fs_instruction_t
-#include "core\kernel\support\NativeHandle.h"
 #include "core\kernel\init\CxbxKrnl.h"
 #include "Logging.h"
 
@@ -44,8 +42,6 @@
 #ifdef RtlZeroMemory
 #undef RtlZeroMemory
 #endif
-
-#define TLS_ALIGNMENT_OFFSET 12
 
 // NT_TIB (Thread Information Block) offsets - see https://www.microsoft.com/msj/archive/S2CE.aspx
 #define TIB_ExceptionList         offsetof(NT_TIB, ExceptionList)         // = 0x00/0
@@ -115,13 +111,13 @@
 // = 0x104/260 */ LIST_ENTRY ThreadListEntry;
 // = 0x10C/268 */ UCHAR _padding[4];
 
-template void EmuGenerateFS<true>(xbox::PETHREAD Ethread, unsigned XboxStackBaseReserved, unsigned XboxStackSizeReserved);
-template void EmuGenerateFS<false>(xbox::PETHREAD Ethread, unsigned XboxStackBaseReserved, unsigned XboxStackSizeReserved);
-
 NT_TIB *GetNtTib()
 {
 	return (NT_TIB *)__readfsdword(TIB_LinearSelfAddress);
 }
+
+
+xbox::KPCR* WINAPI KeGetPcr();
 
 uint32_t fs_lock = 0;
 
@@ -164,7 +160,7 @@ __declspec(naked) void UnlockFS()
 
 void EmuKeSetPcr(xbox::KPCR *Pcr)
 {
-	// Store the Xbox KPCR pointer in FS (See EmuKeGetPcr())
+	// Store the Xbox KPCR pointer in FS (See KeGetPcr())
 	// 
 	// Note : Cxbx currently doesn't do preemptive thread switching,
 	// which implies that thread-state management is done by Windows.
@@ -194,18 +190,41 @@ void EmuKeSetPcr(xbox::KPCR *Pcr)
 
 void EmuKeFreePcr()
 {
-	using namespace xbox;
-	PVOID Pcr = EmuKeGetPcr();
-	ulong_xt Size = zero;
-	ntstatus_xt Status = NtFreeVirtualMemory(&Pcr, &Size, XBOX_MEM_RELEASE); // free pcr
-	assert(Status == X_STATUS_SUCCESS);
-	__writefsdword(TIB_ArbitraryDataSlot, NULL);
+	// NOTE: don't call KeGetPcr because that one creates a new pcr for the thread when __readfsdword returns nullptr, which we don't want
+	xbox::PKPCR Pcr = reinterpret_cast<xbox::PKPCR>(__readfsdword(TIB_ArbitraryDataSlot));
+
+	if (Pcr) {
+		// tls can be nullptr
+		xbox::PVOID Dummy;
+		xbox::ulong_xt Size;
+		xbox::ntstatus_xt Status;
+		if (Pcr->NtTib.StackBase) {
+			// NOTE: the tls pointer was increased by 12 bytes to enforce the 16 bytes alignment, so adjust it to reach the correct pointer
+			// that was allocated by xbox::NtAllocateVirtualMemory
+			Dummy = static_cast<xbox::PBYTE>(Pcr->NtTib.StackBase) - 12;
+			Size = xbox::zero;
+			Status = xbox::NtFreeVirtualMemory(&Dummy, &Size, XBOX_MEM_RELEASE); // free tls
+			assert(Status == X_STATUS_SUCCESS);
+		}
+		Dummy = Pcr->Prcb->CurrentThread;
+		Size = xbox::zero;
+		Status = xbox::NtFreeVirtualMemory(&Dummy, &Size, XBOX_MEM_RELEASE); // free ethread
+		assert(Status == X_STATUS_SUCCESS);
+		Dummy = Pcr;
+		Size = xbox::zero;
+		Status = xbox::NtFreeVirtualMemory(&Dummy, &Size, XBOX_MEM_RELEASE); // free pcr
+		assert(Status == X_STATUS_SUCCESS);
+		__writefsdword(TIB_ArbitraryDataSlot, NULL);
+	}
+	else {
+		EmuLog(LOG_LEVEL::WARNING, "__readfsdword in EmuKeFreePcr returned nullptr: was this called from a non-xbox thread?");
+	}
 }
 
 __declspec(naked) void EmuFS_RefreshKPCR()
 {
-	// Backup all registers, call EmuKeGetPcr and then restore all registers
-	// EmuKeGetPcr makes sure a valid KPCR exists for the current thread
+	// Backup all registers, call KeGetPcr and then restore all registers
+	// KeGetPcr makes sure a valid KPCR exists for the current thread
 	// and creates it if missing, we backup and restore all registers
 	// to keep it safe to call in our patches
 	// This function can be later expanded to do nice things 
@@ -213,7 +232,7 @@ __declspec(naked) void EmuFS_RefreshKPCR()
 	__asm {
 		pushfd
 		pushad
-		call EmuKeGetPcr
+		call KeGetPcr
 		popad
 		popfd
 		ret
@@ -632,32 +651,79 @@ void EmuInitFS()
 	EmuLogEx(CXBXR_MODULE::INIT, LOG_LEVEL::DEBUG, "Done patching FS Register Accesses\n");
 }
 
-// Get Xbox's TIB StackBase address from thread's StackBase.
-xbox::PVOID EmuGetTIBStackBase(xbox::PVOID ThreadStackBase) {
-	xbox::addr_xt StackBaseAddr = reinterpret_cast<xbox::addr_xt>(ThreadStackBase);
-	StackBaseAddr -= sizeof(xbox::FX_SAVE_AREA);
-	return reinterpret_cast<xbox::PVOID>(StackBaseAddr);
-}
-
-// generate stack size reserved for xbox threads to write on.
-xbox::dword_xt EmuGenerateStackSize(xbox::addr_xt& espBaseAddress, xbox::ulong_xt TlsDataSize) {
-	using namespace xbox;
-	dword_xt StackSize = espBaseAddress & 15; // Fix 16 byte alignment
-	espBaseAddress -= StackSize;
-	StackSize += sizeof(FX_SAVE_AREA);
-	TlsDataSize = ALIGN_UP(TlsDataSize, ulong_xt);
-	StackSize += TlsDataSize; // (optional)
-	StackSize += sizeof(KSTART_FRAME);
-	StackSize += sizeof(KSWITCHFRAME);
-	return StackSize;
-}
-
 // generate fs segment selector
-template<bool IsHostThread>
-void EmuGenerateFS(xbox::PETHREAD Ethread, unsigned Host2XbStackBaseReserved, unsigned Host2XbStackSizeReserved)
+void EmuGenerateFS(Xbe::TLS *pTLS, void *pTLSData)
 {
+	void *pNewTLS = nullptr;
 	xbox::PVOID base;
 	xbox::ulong_xt size;
+
+	// Be aware that TLS might be absent (for example in homebrew "Wolf3d-xbox")
+	if (pTLS != nullptr) {
+		// copy global TLS to the current thread
+		{
+            uint32_t dwCopySize = 0;
+            uint32_t dwZeroSize = pTLS->dwSizeofZeroFill;
+
+			if (pTLSData != NULL) {
+				// Make sure the TLS Start and End addresses are within Xbox virtual memory
+				if (pTLS->dwDataStartAddr >= XBE_MAX_VA || pTLS->dwDataEndAddr >= XBE_MAX_VA) {
+					// ignore
+				}
+				else {
+					dwCopySize = pTLS->dwDataEndAddr - pTLS->dwDataStartAddr;
+				}
+			}
+
+			/* + HACK: extra safety padding 0x100 */
+			base = xbox::zeroptr;
+			size = dwCopySize + dwZeroSize + 0x100 + 0xC;
+			xbox::NtAllocateVirtualMemory(&base, 0, &size, XBOX_MEM_RESERVE | XBOX_MEM_COMMIT, XBOX_PAGE_READWRITE);
+			pNewTLS = (void*)base;
+			xbox::RtlZeroMemory(pNewTLS, dwCopySize + dwZeroSize + 0x100 + 0xC);
+			/* Skip the first 12 bytes so that TLSData will be 16 byte aligned (addr returned by NtAllocateVirtualMemory is 4K aligned) */
+			pNewTLS = (uint8_t*)pNewTLS + 12;
+
+			if (dwCopySize > 0) {
+				memcpy((uint8_t*)pNewTLS + 4, pTLSData, dwCopySize);
+			}
+
+#ifdef _DEBUG_TRACE
+            // dump raw TLS data
+            if (pNewTLS == nullptr) {
+                EmuLog(LOG_LEVEL::DEBUG, "TLS Non-Existant (OK)");
+            } else {
+                EmuLog(LOG_LEVEL::DEBUG, "TLS Data Dump...");
+                if (g_bPrintfOn) {
+                    for (uint32_t v = 4; v < dwCopySize + 4; v++) {// Note : Don't dump dwZeroSize
+
+                        uint8_t *bByte = (uint8_t*)pNewTLS + v;
+
+                        if (v % 0x10 == 0) {
+							EmuLog(LOG_LEVEL::DEBUG, "0x%.8X:", (xbox::addr_xt)bByte);
+                        }
+
+                        // Note : Use printf instead of EmuLog here, which prefixes with GetCurrentThreadId() :
+                        printf(" %.2X", *bByte);
+                    }
+
+                    printf("\n");
+                }
+            }
+#endif
+		}
+
+		// prepare TLS
+		{
+			if (pTLS->dwTLSIndexAddr != 0) {
+				*(xbox::addr_xt*)pTLS->dwTLSIndexAddr = xbox::zero;
+			}
+
+			// dword @ pTLSData := pTLSData
+			if (pNewTLS != nullptr)
+				*(void**)pNewTLS = pNewTLS;
+		}
+	}
 
 	// Allocate the xbox KPCR structure
 	base = xbox::zeroptr;
@@ -674,26 +740,21 @@ void EmuGenerateFS(xbox::PETHREAD Ethread, unsigned Host2XbStackBaseReserved, un
 	//
 	// Once we simulate thread switching ourselves, we can update PrcbData.CurrentThread
 	// and simplify this initialization, by using only one KPCR for the single Xbox processor.
-	//
+	// 
 	// One way to do our own (preemprive) thread-switching would be to use this technique :
 	// http://www.eran.io/implementing-a-preemptive-kernel-within-a-single-windows-thread/
 	// See https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/issues/146 for more info.
 
 	// Copy the Nt TIB over to the emulated TIB :
-	NT_TIB* hTib = GetNtTib();
 	{
-		memcpy(XbTib, hTib, sizeof(NT_TIB));
+		memcpy(XbTib, GetNtTib(), sizeof(NT_TIB));
 		// Fixup the TIB self pointer :
 		NewPcr->NtTib.Self = XbTib;
+		// Set the stack base - TODO : Verify this, doesn't look right?
+		NewPcr->NtTib.StackBase = pNewTLS;
 
-		// NOTE: The actual issue was TlsData was not within Host's stack which is now implemented.
-		//       But instead of direct Host's stack, (which should not be tampered from Host's kernel stack block!)
-		//       we allocated through inline asm to reserve xbox stack dynamically in order to have xbox's kernel stack reside in
-		//       host's stack (in permitted function's stack usage).
 		// Write the Xbox stack base to the Host, allows ConvertThreadToFiber to work correctly
-		// Test case:
-		// * DoA2
-		// * DoA3
+		// Test case: DOA3
 		// NOTE: This is disabled due to cause of corruption to host's TIB and
 		//       silent crash for xbox threads creation.
 		// Test case:
@@ -718,92 +779,35 @@ void EmuGenerateFS(xbox::PETHREAD Ethread, unsigned Host2XbStackBaseReserved, un
 		NewPcr->Irql = PASSIVE_LEVEL; // See KeLowerIrql;
 	}
 
-	if constexpr (IsHostThread) {
-		// This only happens for the kernel initialization thread of cxbxr
-		// Another thing to note, we do not insert into xbox's system as it will not be used in running xbox environment.
-		// Instead it will be sleeping until title/user make a decision what to do next.
-		assert(Ethread == xbox::zeroptr);
-
+	// Initialize a fake PrcbData.CurrentThread 
+	{
 		base = xbox::zeroptr;
 		size = sizeof(xbox::ETHREAD);
 		xbox::NtAllocateVirtualMemory(&base, 0, &size, XBOX_MEM_RESERVE | XBOX_MEM_COMMIT, XBOX_PAGE_READWRITE);
-		Ethread = (xbox::PETHREAD)base;
-		xbox::RtlZeroMemory(Ethread, sizeof(xbox::ETHREAD)); // Clear, to prevent side-effects on random contents
-		// Emulate kernel stack size as we can't use exact size.
-		xbox::ulong_xt KernelStackSize = Host2XbStackBaseReserved - reinterpret_cast<xbox::ulong_xt>(hTib->StackLimit);
-		// Since the cxbxr's kernel initialization occur there, we do not create a new thread
-		// and therefore doesn't need to set any additional System/Start details set in the xbox's kernel stack.
-		xbox::KeInitializeThread<IsHostThread>(
-			&Ethread->Tcb,
-			(xbox::PVOID)Host2XbStackBaseReserved,
-			KernelStackSize,
-			xbox::zero,
-			xbox::zeroptr,  // Unused (SystemRoutine)
-			xbox::zeroptr,  // Unused (StartRoutine)
-			xbox::zeroptr,  // Unused (StartContext)
-			xbox::zeroptr); // Unused (&KiUniqueProcess)
-	}
-#ifndef ENABLE_KTHREAD_SWITCHING
-	else {
-		// Otherwise, xbox::PsCreateSystemThreadEx is called and xbox::KeInitializeThread is already called from it.
-		// But we need to carry the reserved part onto host's stack to able align with xbox and host sharing the same stack in a new thread.
-		// Since we are using direct execution than in virtualization environment.
-		// Tcb.StackBase always point at the beginning of kernel stack (DOWN).
-		xbox::addr_xt xStackBase = reinterpret_cast<xbox::addr_xt>(Ethread->Tcb.StackBase);
-		xbox::addr_xt xStackLimit = reinterpret_cast<xbox::addr_xt>(Ethread->Tcb.StackLimit);
-		xbox::addr_xt xTlsData = reinterpret_cast<xbox::addr_xt>(Ethread->Tcb.TlsData);
-		xbox::addr_xt xKernelStack = reinterpret_cast<xbox::addr_xt>(Ethread->Tcb.KernelStack);
-		xbox::dword_xt xKernelStackSize = xStackBase - xKernelStack;
-		assert(xKernelStackSize <= Host2XbStackSizeReserved);
-		PVOID hKernelStack = reinterpret_cast<PVOID>(Host2XbStackBaseReserved - xKernelStackSize);
-		std::memcpy(hKernelStack, Ethread->Tcb.KernelStack, xKernelStackSize);
-		// Update TlsData address if used
-		if (Ethread->Tcb.TlsData) {
-			Ethread->Tcb.TlsData = reinterpret_cast<xbox::PVOID>(Host2XbStackBaseReserved - (xStackBase - xTlsData));
-		}
-		// Set stacks addresses
-		Ethread->Tcb.StackBase = reinterpret_cast<xbox::PVOID>(Host2XbStackBaseReserved);
-		Ethread->Tcb.StackLimit = hTib->StackLimit; // Always point to host's StackLimit.
-		Ethread->Tcb.KernelStack = hKernelStack;
-		// We can safely delete kernel stack as there is no virtualization environment implemented.
-		xbox::MmDeleteKernelStack(reinterpret_cast<xbox::PVOID>(xStackBase), reinterpret_cast<xbox::PVOID>(xStackLimit));
-	}
-#endif
+		xbox::ETHREAD *EThread = (xbox::ETHREAD*)base; // Clear, to prevent side-effects on random contents
+		xbox::RtlZeroMemory(EThread, sizeof(xbox::ETHREAD));
 
-	// Initialize TlsData in order to avoid xbox's APIs attempt to try access null pointer from CxbxrCreateThread.
-	// As far as I have seen, Xapi's CreateThread's startup function is the only one that does the tls' initialization.
-	// It will repeat same process yet will not cause performance impact.
-	// NOTE: PsCreateSystemThread's startup function does not do tls' initialization.
-	if (Ethread->Tcb.TlsData) {
-		Xbe::TLS* XbeTls = (Xbe::TLS*)CxbxKrnl_Xbe->m_Header.dwTLSAddr;
-		uint32_t RawTlsDataSize = XbeTls->dwDataEndAddr - XbeTls->dwDataStartAddr;
-		// First index is a pointer to the array of tls datas.
-		xbox::addr_xt* TlsData = reinterpret_cast<xbox::addr_xt*>(Ethread->Tcb.TlsData);
-		*TlsData = reinterpret_cast<xbox::addr_xt>(Ethread->Tcb.TlsData) + sizeof(xbox::addr_xt);
-		// Set the actual tls data from xbe.
-		TlsData += 1;
-		std::memcpy(TlsData, reinterpret_cast<xbox::PVOID>(XbeTls->dwDataStartAddr), RawTlsDataSize);
-
-		if (XbeTls->dwSizeofZeroFill) {
-			std::memset(reinterpret_cast<xbox::PBYTE>(TlsData) + RawTlsDataSize, 0, XbeTls->dwSizeofZeroFill);
-		}
-	}
-
-	// Initialize a fake PrcbData.CurrentThread 
-	{
-		// TODO: Do we need NtTib's overwrite in ENABLE_KTHREAD_SWITCHING usage?
-		// Set the stack details over to NtTib's structure.
-		NewPcr->NtTib.StackBase = EmuGetTIBStackBase(Ethread->Tcb.StackBase);
-		NewPcr->NtTib.StackLimit = Ethread->Tcb.StackLimit;
+		EThread->Tcb.TlsData = pNewTLS;
+		EThread->UniqueThread = GetCurrentThreadId();
 		// Set PrcbData.CurrentThread
-		Prcb->CurrentThread = (xbox::PKTHREAD)Ethread;
+		Prcb->CurrentThread = (xbox::KTHREAD*)EThread;
+		// Initialize the thread header and its wait list
+		Prcb->CurrentThread->Header.Type = xbox::ThreadObject;
+		Prcb->CurrentThread->Header.Size = sizeof(xbox::KTHREAD) / sizeof(xbox::long_xt);
+		InitializeListHead(&Prcb->CurrentThread->Header.WaitListHead);
+		// Also initialize the timer associated with the thread
+		xbox::KeInitializeTimer(&Prcb->CurrentThread->Timer);
+		xbox::PKWAIT_BLOCK WaitBlock = &Prcb->CurrentThread->TimerWaitBlock;
+		WaitBlock->Object = &Prcb->CurrentThread->Timer;
+		WaitBlock->WaitKey = (xbox::cshort_xt)STATUS_TIMEOUT;
+		WaitBlock->WaitType = xbox::WaitAny;
+		WaitBlock->Thread = Prcb->CurrentThread;
+		WaitBlock->WaitListEntry.Flink = &Prcb->CurrentThread->Timer.Header.WaitListHead;
+		WaitBlock->WaitListEntry.Blink = &Prcb->CurrentThread->Timer.Header.WaitListHead;
 	}
 
-	// Make the KPCR struct available to EmuKeGetPcr()
+	// Make the KPCR struct available to KeGetPcr()
 	EmuKeSetPcr(NewPcr);
 
-	EmuLog(LOG_LEVEL::DEBUG, "Installed KPCR in TIB_ArbitraryDataSlot (with Ethread->Tcb.TlsData = 0x%.8X)", Ethread->Tcb.TlsData);
-
-	_controlfp(_PC_53, _MCW_PC); // Set Precision control to 53 bits (verified setting)
-	_controlfp(_RC_NEAR, _MCW_RC); // Set Rounding control to near (unsure about this)
+	EmuLog(LOG_LEVEL::DEBUG, "Installed KPCR in TIB_ArbitraryDataSlot (with pTLS = 0x%.8X)", pTLS);
 }

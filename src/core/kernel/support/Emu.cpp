@@ -45,12 +45,46 @@ CRITICAL_SECTION dbgCritical;
 // Global Variable(s)
 volatile thread_local  bool    g_bEmuException = false;
 static thread_local bool bOverrideEmuException;
+volatile bool    g_bEmuSuspended = false;
+volatile bool    g_bPrintfOn = true;
 bool g_DisablePixelShaders = false;
 bool g_UseAllCores = false;
 bool g_SkipRdtscPatching = false;
 
+// Delta added to host SystemTime, used in KiClockIsr and KeSetSystemTime
+// This shouldn't need to be atomic, but because raising the IRQL to high lv in KeSetSystemTime doesn't really stop KiClockIsr from running,
+// we need it for now to prevent reading a corrupted value while KeSetSystemTime is in the middle of updating it
+std::atomic_int64_t HostSystemTimeDelta(0);
+
 // Static Function(s)
 static int ExitException(LPEXCEPTION_POINTERS e);
+
+std::string FormatTitleId(uint32_t title_id)
+{
+	std::stringstream ss;
+	
+	// If the Title ID prefix is a printable character, parse it
+	// This shows the correct game serial number for retail titles!
+	// EG: MS-001 for 1st tile published by MS, EA-002 for 2nd title by EA, etc
+	// Some special Xbes (Dashboard, XDK Samples) use non-alphanumeric serials
+	// We fall back to Hex for those
+	// ergo720: we cannot use isalnum() here because it will treat chars in the range -1 - 255 as valid ascii chars which can
+	// lead to unicode characters being printed in the title (e.g.: dashboard uses 0xFE and 0xFF)
+	uint8_t pTitleId1 = (title_id >> 24) & 0xFF;
+	uint8_t pTitleId2 = (title_id >> 16) & 0xFF;
+
+	if ((pTitleId1 < 65 || pTitleId1 > 90) || (pTitleId2 < 65 || pTitleId2 > 90)) {
+		// Prefix was non-printable, so we need to print a hex reprentation of the entire title_id
+		ss << std::setfill('0') << std::setw(8) << std::hex << std::uppercase << title_id;
+		return ss.str();
+	}	
+
+	ss << pTitleId1 << pTitleId2;
+	ss << "-";
+	ss << std::setfill('0') << std::setw(3) << std::dec << (title_id & 0x0000FFFF);
+
+	return ss.str();
+}
 
 std::string EIPToString(xbox::addr_xt EIP)
 {
@@ -119,7 +153,7 @@ bool EmuExceptionBreakpointAsk(LPEXCEPTION_POINTERS e)
 	// We can skip Xbox as long as they are logged so we know about them
 	// There's no need to prevent emulation, we can just pretend we have a debugger attached and continue
 	// This is because some games (such as Crash Bandicoot) spam exceptions;
-	e->ContextRecord->Eip += EmuX86_OpcodeSize((uint8_t*)e->ContextRecord->Eip); // Skip 1 instruction
+	e->ContextRecord->Eip += EmuX86_OpcodeSize((uint8_t*)e->ContextRecord->Eip); // Skip 1 size bytes
 	return true;
 
 #if 1
@@ -152,26 +186,19 @@ bool EmuExceptionBreakpointAsk(LPEXCEPTION_POINTERS e)
 #endif
 }
 
-bool EmuExceptionNonBreakpointUnhandledShow(LPEXCEPTION_POINTERS e)
+void EmuExceptionNonBreakpointUnhandledShow(LPEXCEPTION_POINTERS e)
 {
 	EmuExceptionPrintDebugInformation(e, /*IsBreakpointException=*/false);
 
-	auto result = PopupFatalEx(nullptr, PopupButtons::AbortRetryIgnore, PopupReturn::Abort,
+	if (PopupFatalEx(nullptr, PopupButtons::OkCancel, PopupReturn::Ok,
 		"  The running xbe has encountered an unhandled exception (Code := 0x%.8X) at address 0x%.08X.\n"
 		"\n"
-		"  Press \"Abort\" to terminate emulation.\n"
-		"  Press \"Retry\" to debug.\n"
-		"  Press \"Ignore\" to attempt to continue emulation.",
-		e->ExceptionRecord->ExceptionCode, e->ContextRecord->Eip);
-
-	if (result == PopupReturn::Abort) {
+		"  Press \"OK\" to terminate emulation.\n"
+		"  Press \"Cancel\" to debug.",
+		e->ExceptionRecord->ExceptionCode, e->ContextRecord->Eip) == PopupReturn::Ok)
+	{
 		EmuExceptionExitProcess();
-	} else if (result == PopupReturn::Ignore) {
-		e->ContextRecord->Eip += EmuX86_OpcodeSize((uint8_t*)e->ContextRecord->Eip); // Skip 1 instruction
-		return true;
 	}
-
-	return false;
 }
 
 // Returns weither the given address is part of an Xbox managed memory region
@@ -187,8 +214,7 @@ bool IsXboxCodeAddress(xbox::addr_xt addr)
 #include "distorm.h"
 bool EmuX86_DecodeOpcode(const uint8_t* Eip, _DInst& info);
 void EmuX86_DistormLogInstruction(const uint8_t* Eip, _DInst& info, LOG_LEVEL log_level);
-bool genericException(EXCEPTION_POINTERS *e)
-{
+void genericException(EXCEPTION_POINTERS *e) {
 	_DInst info;
 	if (EmuX86_DecodeOpcode((uint8_t*)e->ContextRecord->Eip, info)) {
 		EmuX86_DistormLogInstruction((uint8_t*)e->ContextRecord->Eip, info, LOG_LEVEL::FATAL);
@@ -203,14 +229,11 @@ bool genericException(EXCEPTION_POINTERS *e)
 		}
 
 		// Bypass exception
-		return false;
 	}
 	else {
 		// notify user
-		return EmuExceptionNonBreakpointUnhandledShow(e);
+		EmuExceptionNonBreakpointUnhandledShow(e);
 	}
-
-	return false;
 }
 
 bool IsRdtscInstruction(xbox::addr_xt addr); // Implemented in CxbxKrnl.cpp
@@ -276,7 +299,8 @@ bool EmuTryHandleException(EXCEPTION_POINTERS *e)
 
 	// Check if lle exception is already called first before emu exception.
 	if (bOverrideEmuException) {
-		return genericException(e);
+		genericException(e);
+		return false;
 	}
 
 	if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
@@ -314,7 +338,10 @@ bool EmuTryHandleException(EXCEPTION_POINTERS *e)
 		}
 	}
 
-	return genericException(e);
+	genericException(e);
+
+	// Unhandled exception :
+	return false;
 }
 
 long WINAPI EmuException(struct _EXCEPTION_POINTERS* e)

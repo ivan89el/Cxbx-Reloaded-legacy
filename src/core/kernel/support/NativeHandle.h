@@ -29,16 +29,6 @@
 
 #include <optional>
 
-// Use GetObjectNativeHandle if certain object type is fully implemented, otherwise use GetNativeHandle instead.
-template<bool NoConversion = false> std::optional<HANDLE> GetNativeHandle(xbox::HANDLE xhandle);
-
-template<bool PartitionConversion = false> void RegisterXboxObject(xbox::PVOID xobject, HANDLE nhandle);
-void RemoveXboxObject(xbox::PVOID xobject);
-// Use GetObjectNativeHandle if certain object type is fully implemented, otherwise use GetNativeHandle instead.
-template<bool PartitionConversion = true> std::optional<HANDLE> GetObjectNativeHandle(xbox::PVOID xobject);
-
-// Attach string to existing xbox object.
-void AttachStringToXboxObject(xbox::PVOID xobject, const std::string& string);
-
-std::string Object2AbsolutePath(xbox::PVOID xobject);
-std::string Object2RemainingPath(xbox::PVOID xobject);
+void RegisterXboxHandle(xbox::HANDLE xhandle, HANDLE nhandle);
+void RemoveXboxHandle(xbox::HANDLE xhandle);
+std::optional<HANDLE> GetNativeHandle(xbox::HANDLE xhandle);

@@ -58,6 +58,7 @@ void EmuPrintStackTrace(PCONTEXT ContextRecord);
 
 // global flags specifying current emulation state
 extern volatile thread_local bool g_bEmuException;
+extern volatile bool g_bEmuSuspended;
 
 // global exception patching address
 extern void * funcExclude[2048];
@@ -66,7 +67,14 @@ extern HWND   g_hEmuWindow;
 
 #define GET_FRONT_WINDOW_HANDLE ((CxbxKrnl_hEmuParent != nullptr) ? CxbxKrnl_hEmuParent : g_hEmuWindow)
 
+// thread notification routine
+extern PVOID g_pfnThreadNotification[16];
+extern int g_iThreadNotificationCount;
+
 extern HANDLE g_CurrentProcessHandle; // Set in CxbxKrnlMain
+
+// Delta added to host SystemTime, used in KiClockIsr and KeSetSystemTime
+extern std::atomic_int64_t HostSystemTimeDelta;
 
 typedef struct DUMMY_KERNEL
 {
