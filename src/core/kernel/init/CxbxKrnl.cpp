@@ -30,21 +30,26 @@
 
 
 #include <core\kernel\exports\xboxkrnl.h>
+#include "gui/resource/ResCxbx.h"
+#include "core\kernel\init\CxbxKrnl.h"
 #include "common\xbdm\CxbxXbdm.h" // For Cxbx_LibXbdmThunkTable
+#include "CxbxVersion.h"
+#include "core\kernel\support\Emu.h"
 #include "core/kernel/support/PatchRdtsc.hpp"
-#include "devices\x86\EmuX86.h" // For EmuX86_Init
+#include "devices\x86\EmuX86.h"
 #include "core\kernel\support\EmuFile.h"
 #include "core\kernel\support\EmuFS.h" // EmuInitFS
-#include "EmuEEPROM.h" // For CxbxRestoreEEPROM, EEPROM
+#include "EmuEEPROM.h" // For CxbxRestoreEEPROM, EEPROM, XboxFactoryGameRegion
 #include "core\kernel\exports\EmuKrnl.h"
 #include "core\kernel\exports\EmuKrnlKi.h"
-#include "core\kernel\exports\EmuKrnlKe.h"
-#include "core\kernel\exports\EmuKrnlPs.hpp"
 #include "EmuShared.h"
 #include "core\hle\D3D8\Direct3D9\Direct3D9.h" // For CxbxInitWindow, EmuD3DInit
 #include "core\hle\DSOUND\DirectSound\DirectSound.hpp" // For CxbxInitAudio
+#ifdef CHIHIRO_WORK
 #include "core\hle\JVS\JVS.h" // For JVS_Init
+#endif
 #include "core\hle\Intercept.hpp"
+#include "ReservedMemory.h" // For virtual_memory_placeholder
 #include "core\kernel\memory-manager\VMManager.h"
 #include "CxbxDebugger.h"
 #include "common/util/cliConfig.hpp"
@@ -52,19 +57,20 @@
 #include "common/ReserveAddressRanges.h"
 #include "common/xbox/Types.hpp"
 #include "common/win32/WineEnv.h"
+#include "core/common/video/RenderBase.hpp"
 
 #include <clocale>
 #include <process.h>
+#include <time.h> // For time()
 #include <sstream> // For std::ostringstream
 
 #include "devices\EEPROMDevice.h" // For g_EEPROM
 #include "devices\Xbox.h" // For InitXboxHardware()
 #include "devices\LED.h" // For LED::Sequence
+#include "devices\SMCDevice.h" // For SMC Access
 #include "common\crypto\EmuSha.h" // For the SHA1 functions
-#include "common/Timer.h" // For Timer_Init
+#include "Timer.h" // For Timer_Init
 #include "common\input\InputManager.h" // For the InputDeviceManager
-#include "core/kernel/support/NativeHandle.h"
-#include "common/win32/Util.h" // for WinError2Str
 
 #include "common/FilePaths.hpp"
 
@@ -82,33 +88,37 @@ Xbe::Header *CxbxKrnl_XbeHeader = NULL;
 /*! indicates a debug kernel */
 bool g_bIsDebugKernel = false;
 
+HWND CxbxKrnl_hEmuParent = NULL;
 DebugMode CxbxrKrnl_DebugMode = DebugMode::DM_NONE;
 std::string CxbxrKrnl_DebugFileName = "";
 Xbe::Certificate *g_pCertificate = NULL;
 
-// Hybrid host/xbox path to the xbe.
-// A semicolon in the path indicates the Xbox mount point.
-// Replacing the ';' with '\' gives a regular host path.
-// NOTE: LAUNCH_DATA_HEADER's szLaunchPath is xbox::max_path*2 = 520
-char szFilePath_Xbe[xbox::max_path*2] = { 0 };
+/*! thread handles */
+static std::vector<HANDLE> g_hThreads;
+
+char szFilePath_CxbxReloaded_Exe[MAX_PATH] = { 0 };
+std::string g_DataFilePath;
+char szFilePath_EEPROM_bin[MAX_PATH] = { 0 };
+char szFilePath_Xbe[xbox::max_path*2] = { 0 }; // NOTE: LAUNCH_DATA_HEADER's szLaunchPath is xbox::max_path*2 = 520
 
 Xbe* CxbxKrnl_Xbe = NULL;
 bool g_bIsChihiro = false;
 bool g_bIsDevKit = false;
 bool g_bIsRetail = false;
 
+// Indicates to disable/enable all interrupts when cli and sti instructions are executed
+std::atomic_bool g_bEnableAllInterrupts = true;
+
 // Set by the VMManager during initialization. Exported because it's needed in other parts of the emu
 size_t g_SystemMaxMemory = 0;
 
-HANDLE g_CurrentProcessHandle = 0; // Set in CxbxKrnlEmulate
+HANDLE g_CurrentProcessHandle = 0; // Set in CxbxKrnlMain
 
 bool g_CxbxPrintUEM = false;
 ULONG g_CxbxFatalErrorCode = FATAL_ERROR_NONE;
 
 // Define function located in EmuXApi so we can call it from here
 void SetupXboxDeviceTypes();
-
-extern xbox::void_xt NTAPI system_events(xbox::PVOID arg);
 
 void SetupPerTitleKeys()
 {
@@ -131,11 +141,9 @@ void SetupPerTitleKeys()
 
 }
 
-xbox::void_xt NTAPI CxbxLaunchXbe(xbox::PVOID Entry)
+void CxbxLaunchXbe(void(*Entry)())
 {
-	EmuLogInit(LOG_LEVEL::DEBUG, "Calling XBE entry point...");
-	static_cast<void(*)()>(Entry)();
-	EmuLogInit(LOG_LEVEL::DEBUG, "XBE entry point returned");
+	Entry();
 }
 
 // Entry point address XOR keys per Xbe type (Retail, Debug or Chihiro) :
@@ -326,6 +334,73 @@ void InitSoftwareInterrupts()
 }
 #endif
 
+void TriggerPendingConnectedInterrupts()
+{
+	for (int i = 0; i < MAX_BUS_INTERRUPT_LEVEL; i++) {
+		// If the interrupt is pending and connected, process it
+		if (HalSystemInterrupts[i].IsPending() && EmuInterruptList[i] && EmuInterruptList[i]->Connected) {
+			HalSystemInterrupts[i].Trigger(EmuInterruptList[i]);
+		}
+		SwitchToThread();
+	}
+}
+
+static unsigned int WINAPI CxbxKrnlInterruptThread(PVOID param)
+{
+	CxbxSetThreadName("CxbxKrnl Interrupts");
+
+	// Make sure Xbox1 code runs on one core :
+	InitXboxThread();
+	g_AffinityPolicy->SetAffinityXbox();
+
+#if 0
+	InitSoftwareInterrupts();
+#endif
+
+	while (true) {
+		if (g_bEnableAllInterrupts) {
+			TriggerPendingConnectedInterrupts();
+		}
+		Sleep(1);
+	}
+
+	return 0;
+}
+
+static void CxbxKrnlClockThread(void* pVoid)
+{
+	LARGE_INTEGER CurrentTicks;
+	uint64_t Delta;
+	uint64_t Microseconds;
+	unsigned int IncrementScaling;
+	static uint64_t LastTicks = 0;
+	static uint64_t Error = 0;
+	static uint64_t UnaccountedMicroseconds = 0;
+
+	// This keeps track of how many us have elapsed between two cycles, so that the xbox clocks are updated
+	// with the proper increment (instead of blindly adding a single increment at every step)
+
+	if (LastTicks == 0) {
+		QueryPerformanceCounter(&CurrentTicks);
+		LastTicks = CurrentTicks.QuadPart;
+		CurrentTicks.QuadPart = 0;
+	}
+
+	QueryPerformanceCounter(&CurrentTicks);
+	Delta = CurrentTicks.QuadPart - LastTicks;
+	LastTicks = CurrentTicks.QuadPart;
+
+	Error += (Delta * SCALE_S_IN_US);
+	Microseconds = Error / HostQPCFrequency;
+	Error -= (Microseconds * HostQPCFrequency);
+
+	UnaccountedMicroseconds += Microseconds;
+	IncrementScaling = (unsigned int)(UnaccountedMicroseconds / 1000); // -> 1 ms = 1000us -> time between two xbox clock interrupts
+	UnaccountedMicroseconds -= (IncrementScaling * 1000);
+
+	xbox::KiClockIsr(IncrementScaling);
+}
+
 void MapThunkTable(uint32_t* kt, uint32_t* pThunkTable)
 {
     const bool SendDebugReports = (pThunkTable == CxbxKrnl_KernelThunkTable) && CxbxDebugger::CanReport();
@@ -366,6 +441,52 @@ void ImportLibraries(XbeImportEntry *pImportDirectory)
 
 		pImportDirectory++;
 	}
+}
+
+bool CreateSettings()
+{
+	g_Settings = new Settings();
+	if (g_Settings == nullptr) {
+		PopupError(nullptr, szSettings_alloc_error);
+		return false;
+	}
+
+	if (!g_Settings->Init()) {
+		return false;
+	}
+
+	log_get_settings();
+	return true;
+}
+
+bool HandleFirstLaunch()
+{
+	bool bFirstLaunch;
+	g_EmuShared->GetIsFirstLaunch(&bFirstLaunch);
+
+	/* check if process is launch with elevated access then prompt for continue on or not. */
+	if (!bFirstLaunch) {
+		if (!CreateSettings()) {
+			return false;
+		}
+
+		// Wine will always run programs as administrator by default, it can be safely disregard.
+		// Since Wine doesn't use root permission. Unless user is running Wine as root.
+		bool bElevated = CxbxIsElevated();
+		if (bElevated && !isWineEnv() && !g_Settings->m_core.allowAdminPrivilege) {
+			PopupReturn ret = PopupWarningEx(nullptr, PopupButtons::YesNo, PopupReturn::No,
+				"Cxbx-Reloaded has detected that it has been launched with Administrator rights.\n"
+				"\nThis is dangerous, as a maliciously modified Xbox titles could take control of your system.\n"
+				"\nAre you sure you want to continue?");
+			if (ret != PopupReturn::Yes) {
+				return false;
+			}
+		}
+
+		g_EmuShared->SetIsFirstLaunch(true);
+	}
+
+	return true;
 }
 
 FILE* CxbxrKrnlSetupVerboseLog(int BootFlags)
@@ -446,7 +567,7 @@ static void CxbxrKrnlSyncGUI()
 				if (mbRet == PopupReturn::Retry) {
 					continue;
 				}
-				CxbxrShutDown();
+				CxbxKrnlShutDown();
 			}
 			break;
 		} while (true);
@@ -455,10 +576,21 @@ static void CxbxrKrnlSyncGUI()
 
 static void CxbxrKrnlSetupMemorySystem(int BootFlags, unsigned emulate_system, unsigned reserved_systems, blocks_reserved_t blocks_reserved)
 {
+#ifndef CXBXR_EMU
+	// Only for GUI executable with emulation code.
+	blocks_reserved_t blocks_reserved_gui = { 0 };
+	// Reserve console system's memory ranges before start initialize.
+	if (!ReserveAddressRanges(emulate_system, blocks_reserved_gui)) {
+		CxbxrKrnlAbort("Failed to reserve required memory ranges!", GetLastError());
+	}
+	// Initialize the memory manager
+	g_VMManager.Initialize(emulate_system, BootFlags, blocks_reserved_gui);
+#else
 	// Release unnecessary memory ranges to allow console/host to use those memory ranges.
 	FreeAddressRanges(emulate_system, reserved_systems, blocks_reserved);
 	// Initialize the memory manager
 	g_VMManager.Initialize(emulate_system, BootFlags, blocks_reserved);
+#endif
 
 	// Commit the memory used by the xbe header
 	size_t HeaderSize = CxbxKrnl_Xbe->m_Header.dwSizeofHeaders;
@@ -481,16 +613,13 @@ static void CxbxrKrnlSetupMemorySystem(int BootFlags, unsigned emulate_system, u
 	}
 }
 
-static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
-                                       unsigned& reserved_systems,
-                                       blocks_reserved_t blocks_reserved,
-                                       HardwareModel &hardwareModel)
+static bool CxbxrKrnlXbeSystemSelector(int BootFlags, unsigned& reserved_systems, blocks_reserved_t blocks_reserved)
 {
 	unsigned int emulate_system = 0;
 	// Get title path :
 	std::string xbePath;
 	cli_config::GetValue(cli_config::load, &xbePath);
-	xbePath = std::filesystem::absolute(xbePath).string();
+	xbePath = std::filesystem::absolute(std::filesystem::path(xbePath)).string();
 
 	// NOTE: This is a safety to clean the file path for any malicious file path attempt.
 	// Might want to move this into a utility function.
@@ -507,15 +636,85 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 
 	// Once clean up process is done, proceed set to global variable string.
 	strncpy(szFilePath_Xbe, xbePath.c_str(), xbox::max_path - 1);
-	// Convert to host path by replacing special mount point character if present
-	std::replace(xbePath.begin(), xbePath.end(), ';', '\\');
+	std::replace(xbePath.begin(), xbePath.end(), ';', '/');
 	// Load Xbe (this one will reside above WinMain's virtual_memory_placeholder)
 	std::filesystem::path xbeDirectory = std::filesystem::path(xbePath).parent_path();
 
-	CxbxKrnl_Xbe = new Xbe(xbePath.c_str()); // TODO : Instead of using the Xbe class, port Dxbx _ReadXbeBlock()
+#ifdef CHIHIRO_WORK
+	// If the Xbe is Chihiro, and we were not launched by SEGABOOT, we need to load SEGABOOT from the Chihiro Media Board rom instead!
+	// If the XBE path contains a boot.id, it must be a Chihiro title
+	// This is necessary as some Chihiro games use the Debug xor instead of the Chihiro ones
+	// which means we cannot rely on that alone.
+	if (BootFlags == BOOT_NONE && std::filesystem::exists(xbeDirectory / "boot.id")) {
+
+		std::string chihiroMediaBoardRom = g_DataFilePath + "/EmuDisk/" + MediaBoardRomFile;
+		if (!std::filesystem::exists(chihiroMediaBoardRom)) {
+			CxbxrKrnlAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) could not be found");
+		}
+
+		// Open a handle to the mediaboard rom
+		FILE* fpRom = fopen(chihiroMediaBoardRom.c_str(), "rb");
+		if (fpRom == nullptr) {
+			CxbxrKrnlAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) could not opened for read");
+		}
+
+		// Verify the size of media board rom
+		fseek(fpRom, 0, SEEK_END);
+		auto length = ftell(fpRom);
+		if (length != 2 * ONE_MB) {
+			CxbxrKrnlAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) has an invalid size");
+
+		}
+		fseek(fpRom, 0, SEEK_SET);
+
+		// Extract SEGABOOT_OLD.XBE and SEGABOOT.XBE from Media Rom
+		// We only do this if SEGABOOT_OLD and SEGABOOT.XBE are *not* already present
+		std::string chihiroSegaBootOld = g_DataFilePath + "/EmuDisk/" + MediaBoardSegaBoot0;
+		std::string chihiroSegaBootNew = g_DataFilePath + "/EmuDisk/" + MediaBoardSegaBoot1;
+		if (!std::filesystem::exists(chihiroSegaBootOld) || !std::filesystem::exists(chihiroSegaBootNew)) {
+			FILE* fpSegaBootOld = fopen(chihiroSegaBootOld.c_str(), "wb");
+			FILE* fpSegaBootNew = fopen(chihiroSegaBootNew.c_str(), "wb");
+			if (fpSegaBootNew == nullptr || fpSegaBootOld == nullptr) {
+				CxbxrKrnlAbort("Could not open SEGABOOT for writing");
+
+			}
+
+			// Extract SEGABOOT (Old)
+			void* buffer = malloc(ONE_MB);
+			if (buffer == nullptr) {
+				CxbxrKrnlAbort("Could not allocate buffer for SEGABOOT");
+
+			}
+
+			fread(buffer, 1, ONE_MB, fpRom);
+			fwrite(buffer, 1, ONE_MB, fpSegaBootOld);
+
+			// Extract SEGABOOT (New)
+			fread(buffer, 1, ONE_MB, fpRom);
+			fwrite(buffer, 1, ONE_MB, fpSegaBootNew);
+
+			free(buffer);
+
+			fclose(fpSegaBootOld);
+			fclose(fpSegaBootNew);
+			fclose(fpRom);
+
+		}
+
+		g_EmuShared->SetTitleMountPath(xbeDirectory.string().c_str());
+
+		// Launch Segaboot
+		CxbxLaunchNewXbe(chihiroSegaBootNew);
+		CxbxKrnlShutDown(true);
+		TerminateProcess(GetCurrentProcess(), EXIT_SUCCESS);
+
+	}
+#endif // Chihiro wip block
+
+	CxbxKrnl_Xbe = new Xbe(xbePath.c_str(), false); // TODO : Instead of using the Xbe class, port Dxbx _ReadXbeBlock()
 
 	if (CxbxKrnl_Xbe->HasFatalError()) {
-		CxbxrAbort(CxbxKrnl_Xbe->GetError().c_str());
+		CxbxrKrnlAbort(CxbxKrnl_Xbe->GetError().c_str());
 		return false;
 	}
 
@@ -555,7 +754,6 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 		// Detect XBE type :
 		XbeType xbeType = CxbxKrnl_Xbe->GetXbeType();
 		EmuLogInit(LOG_LEVEL::INFO, "Auto detect: XbeType = %s", GetXbeTypeToStr(xbeType));
-
 		// Convert XBE type into corresponding system to emulate.
 		switch (xbeType) {
 			case XbeType::xtChihiro:
@@ -569,90 +767,16 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 				break;
 			DEFAULT_UNREACHABLE;
 		}
-
-		// If the XBE path contains a boot.id, it must be a Chihiro title
-		// This is necessary as some Chihiro games use the Debug xor instead of the Chihiro ones
-		// which means we cannot rely on that alone.
-		if (std::filesystem::exists(xbeDirectory / "boot.id")) {
-			emulate_system = SYSTEM_CHIHIRO;
-		}
 	}
 
 	EmuLogInit(LOG_LEVEL::INFO, "Host's compatible system types: %2X", reserved_systems);
 	// If the system to emulate isn't supported on host, enforce failure.
 	if (!isSystemFlagSupport(reserved_systems, emulate_system)) {
-		CxbxrAbort("Unable to emulate system type due to host is not able to reserve required memory ranges.");
+		CxbxrKrnlAbort("Unable to emulate system type due to host is not able to reserve required memory ranges.");
 		return false;
 	}
 	// Clear emulation system from reserved systems so all unneeded memory ranges can be freed.
 	reserved_systems &= ~emulate_system;
-
-	// If the Xbe is Chihiro, and we were not launched by SEGABOOT, we need to load SEGABOOT from the Chihiro Media Board rom instead!
-	// All checks are absolutely necessary in order to support both "auto select" and forced chihiro mode.
-	if (BootFlags == BOOT_NONE &&
-		emulate_system == SYSTEM_CHIHIRO &&
-		std::filesystem::exists(xbeDirectory / "boot.id")) {
-
-		std::string chihiroMediaBoardRom = g_MediaBoardBasePath + MediaBoardRomFile;
-		if (!std::filesystem::exists(chihiroMediaBoardRom)) {
-			CxbxrAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) could not be found (should be placed in /EmuMediaBoard/)");
-		}
-
-		// Open a handle to the mediaboard rom
-		FILE* fpRom = fopen(chihiroMediaBoardRom.c_str(), "rb");
-		if (fpRom == nullptr) {
-			CxbxrAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) could not be opened for read");
-		}
-
-		// Verify the size of media board rom
-		fseek(fpRom, 0, SEEK_END);
-		auto length = ftell(fpRom);
-		if (length != 2 * ONE_MB) {
-			CxbxrAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) has an invalid size");
-
-		}
-		fseek(fpRom, 0, SEEK_SET);
-
-		// Extract SEGABOOT_OLD.XBE and SEGABOOT.XBE from Media Rom
-		// We only do this if SEGABOOT_OLD and SEGABOOT.XBE are *not* already present
-		std::string chihiroSegaBootOld = g_MediaBoardBasePath + MediaBoardSegaBoot0;
-		std::string chihiroSegaBootNew = g_MediaBoardBasePath + MediaBoardSegaBoot1;
-		if (!std::filesystem::exists(chihiroSegaBootOld) || !std::filesystem::exists(chihiroSegaBootNew)) {
-			FILE* fpSegaBootOld = fopen(chihiroSegaBootOld.c_str(), "wb");
-			FILE* fpSegaBootNew = fopen(chihiroSegaBootNew.c_str(), "wb");
-			if (fpSegaBootNew == nullptr || fpSegaBootOld == nullptr) {
-				CxbxrAbort("Could not open SEGABOOT for writing");
-
-			}
-
-			// Extract SEGABOOT (Old)
-			void* buffer = malloc(ONE_MB);
-			if (buffer == nullptr) {
-				CxbxrAbort("Could not allocate buffer for SEGABOOT");
-
-			}
-
-			fread(buffer, 1, ONE_MB, fpRom);
-			fwrite(buffer, 1, ONE_MB, fpSegaBootOld);
-
-			// Extract SEGABOOT (New)
-			fread(buffer, 1, ONE_MB, fpRom);
-			fwrite(buffer, 1, ONE_MB, fpSegaBootNew);
-
-			free(buffer);
-
-			fclose(fpSegaBootOld);
-			fclose(fpSegaBootNew);
-			fclose(fpRom);
-
-		}
-
-		g_EmuShared->SetTitleMountPath(xbeDirectory.string().c_str());
-
-		// Launch Segaboot
-		CxbxLaunchNewXbe(chihiroSegaBootNew);
-		CxbxrShutDown(true);
-	}
 
 	// Once we have determine which system type to run as, enforce it in future reboots.
 	if ((BootFlags & BOOT_QUICK_REBOOT) == 0) {
@@ -664,23 +788,18 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 	g_bIsChihiro = (emulate_system == SYSTEM_CHIHIRO);
 	g_bIsDevKit = (emulate_system == SYSTEM_DEVKIT);
 	g_bIsRetail = (emulate_system == SYSTEM_XBOX);
-	if (g_bIsChihiro) {
-		hardwareModel = HardwareModel::Chihiro_Type1; // TODO: Make configurable to support Type-3 console.
-	}
-	else if (g_bIsDevKit) {
-		hardwareModel = HardwareModel::DebugKit_r1_2; // Unlikely need to make configurable.
-	}
-	// Retail (default)
-	else {
-		// Should not be configurable. Otherwise, titles compiled with newer XDK will patch older xbox kernel.
-		hardwareModel = HardwareModel::Revision1_6;
-	}
 
+#ifdef CHIHIRO_WORK
 	// If this is a Chihiro title, we need to patch the init flags to disable HDD setup
 	// The Chihiro kernel does this, so we should too!
 	if (g_bIsChihiro) {
 		CxbxKrnl_Xbe->m_Header.dwInitFlags.bDontSetupHarddisk = true;
 	}
+#else
+	if (g_bIsChihiro) {
+		CxbxrKrnlAbort("Emulating Chihiro mode does not work yet. Please use different title to emulate.");
+	}
+#endif
 
 	CxbxrKrnlSetupMemorySystem(BootFlags, emulate_system, reserved_systems, blocks_reserved);
 	return true;
@@ -708,7 +827,7 @@ static void CxbxrKrnlXbePatchXBEHSig() {
 	}
 }
 
-static void CxbxrKrnlGetRelativePath(std::filesystem::path& get_relative_path) {
+static size_t CxbxrKrnlGetRelativePath(std::filesystem::path& get_relative_path) {
 	// Determine location for where possible auto mount D letter if ";" delimiter exist.
 	// Also used to store in EmuShared's title mount path permanent storage on first emulation launch.
 	// Unless it's launch within Cxbx-Reloaded's EmuDisk directly, then we don't store anything in title mount path storage.
@@ -718,7 +837,7 @@ static void CxbxrKrnlGetRelativePath(std::filesystem::path& get_relative_path) {
 	// Then we must obey the current directory it asked for.
 	if (lastFind != std::string::npos) {
 		if (relative_path.find(';', lastFind + 1) != std::string::npos) {
-			CxbxrAbortEx(LOG_PREFIX_INIT, "Cannot contain multiple of ; symbol.");
+			CxbxrKrnlAbortEx(LOG_PREFIX_INIT, "Cannot contain multiple of ; symbol.");
 		}
 		relative_path = relative_path.substr(0, lastFind);
 	}
@@ -728,6 +847,81 @@ static void CxbxrKrnlGetRelativePath(std::filesystem::path& get_relative_path) {
 	CxbxResolveHostToFullPath(relative_path, "xbe's directory");
 
 	get_relative_path = relative_path;
+	return lastFind;
+}
+
+static void CxbxrKrnlSetupSymLinks(int CxbxCdrom0DeviceIndex, int lastFind, std::filesystem::path& relative_path)
+{
+	// Create default symbolic links :
+	EmuLogInit(LOG_LEVEL::DEBUG, "Creating default symbolic links.");
+	// TODO: DriveD should auto mount based on the launchdata page's ; delimiter in the xbe path.
+	// This is the only symbolic link the Xbox Kernel sets, the rest are set by the application, usually via XAPI.
+	// If the Xbe is located outside of the emulated HDD, mounting it as DeviceCdrom0 is correct
+	// If the Xbe is located inside the emulated HDD, the full path should be used, eg: "\\Harddisk0\\partition2\\xboxdash.xbe"
+#ifdef CXBX_KERNEL_REWORK_ENABLED
+	if (lastFind != std::string::npos) {
+#else
+	// HACK: It is a hack to override XDK's default mount to CdRom0 which may not exist when launch to dashboard directly.
+	// Otherwise, titles may launch to dashboard, more specifically xbox live title, and back.
+	if (CxbxCdrom0DeviceIndex == -1 || lastFind != std::string::npos) {
+#endif
+		CxbxCreateSymbolicLink(DriveD, relative_path.string());
+	}
+}
+
+static void CxbxrKrnlSetupCdRom0Path(int BootFlags, int lastFind, std::filesystem::path relative_path, bool isEmuDisk)
+{
+	int CxbxCdrom0DeviceIndex = -1;
+	// Check if title mounth path is already set. This may occur from early boot of Chihiro title.
+	char title_mount_path[sizeof(szFilePath_Xbe)];
+	g_EmuShared->GetTitleMountPath(title_mount_path);
+	std::filesystem::path default_mount_path = title_mount_path;
+
+	if (default_mount_path.native()[0] == 0 && BootFlags == BOOT_NONE) {
+		// Remember our first initialize mount path for CdRom0 and Mbfs.
+		if (!isEmuDisk) {
+			g_EmuShared->SetTitleMountPath(relative_path.string().c_str());
+			default_mount_path = relative_path.c_str();
+		}
+	}
+
+	// TODO: Find a place to make permanent placement for DeviceCdrom0 that does not have disc loaded.
+	if (default_mount_path.native()[0] != 0) {
+		// NOTE: Don't need to perform CxbxResolveHostToFullPath again for default_mount_path.
+		CxbxCdrom0DeviceIndex = CxbxRegisterDeviceHostPath(DeviceCdrom0, default_mount_path.string());
+		// Since Chihiro also map Mbfs to the same path as Cdrom0, we'll map it the same way.
+		if (g_bIsChihiro) {
+			(void)CxbxRegisterDeviceHostPath(DriveMbfs, default_mount_path.string());
+		}
+	}
+
+	CxbxrKrnlSetupSymLinks(CxbxCdrom0DeviceIndex, lastFind, relative_path);
+}
+
+static void CxbxrKrnlRegisterDevicePaths()
+{
+	// Partition 0 contains configuration data, and is accessed as a native file, instead as a folder :
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition0, g_DiskBasePath + "Partition0", /*IsFile=*/true);
+	// The first two partitions are for Data and Shell files, respectively :
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition1, g_DiskBasePath + "Partition1");
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition2, g_DiskBasePath + "Partition2");
+	// The following partitions are for caching purposes - for now we allocate up to 7 (as xbmp needs that many) :
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition3, g_DiskBasePath + "Partition3");
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition4, g_DiskBasePath + "Partition4");
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition5, g_DiskBasePath + "Partition5");
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition6, g_DiskBasePath + "Partition6");
+	CxbxRegisterDeviceHostPath(DeviceHarddisk0Partition7, g_DiskBasePath + "Partition7");
+	CxbxRegisterDeviceHostPath(DevicePrefix + "\\Chihiro", g_DiskBasePath + "Chihiro");
+
+	// Create the MU directories and the bin files
+	CxbxRegisterDeviceHostPath(DeviceMU0, g_MuBasePath + "F", false, sizeof(FATX_SUPERBLOCK));
+	CxbxRegisterDeviceHostPath(DeviceMU1, g_MuBasePath + "G", false, sizeof(FATX_SUPERBLOCK));
+	CxbxRegisterDeviceHostPath(DeviceMU2, g_MuBasePath + "H", false, sizeof(FATX_SUPERBLOCK));
+	CxbxRegisterDeviceHostPath(DeviceMU3, g_MuBasePath + "I", false, sizeof(FATX_SUPERBLOCK));
+	CxbxRegisterDeviceHostPath(DeviceMU4, g_MuBasePath + "J", false, sizeof(FATX_SUPERBLOCK));
+	CxbxRegisterDeviceHostPath(DeviceMU5, g_MuBasePath + "K", false, sizeof(FATX_SUPERBLOCK));
+	CxbxRegisterDeviceHostPath(DeviceMU6, g_MuBasePath + "L", false, sizeof(FATX_SUPERBLOCK));
+	CxbxRegisterDeviceHostPath(DeviceMU7, g_MuBasePath + "M", false, sizeof(FATX_SUPERBLOCK));
 }
 
 static bool CxbxrKrnlPrepareXbeMap()
@@ -746,6 +940,15 @@ static bool CxbxrKrnlPrepareXbeMap()
 		PopupFatal(nullptr, "Cxbx-Reloaded executuable requires it's base of code to be 0x00001000");
 		return false; // TODO : Halt(0);
 	}
+
+#ifndef CXBXR_EMU
+	// verify virtual_memory_placeholder is located at 0x00011000
+	if ((UINT_PTR)(&(virtual_memory_placeholder[0])) != (XBE_IMAGE_BASE + CXBX_BASE_OF_CODE))
+	{
+		PopupFatal(nullptr, "virtual_memory_placeholder is not loaded to base address 0x00011000 (which is a requirement for Xbox emulation)");
+		return false; // TODO : Halt(0);
+	}
+#endif
 
 	// Create a safe copy of the complete EXE header:
 	DWORD ExeHeaderSize = ExeOptionalHeader->SizeOfHeaders; // Should end up as 0x400
@@ -811,8 +1014,7 @@ static bool CxbxrKrnlPrepareXbeMap()
 	Xbe::Header* XbeHeader,
 	uint32_t XbeHeaderSize,
 	void (*Entry)(),
-	int BootFlags,
-	HardwareModel hardwareModel
+	int BootFlags
 );
 
 void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_reserved)
@@ -821,16 +1023,13 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	// and capture any crash from this point and beyond. Useful for capture live crash and generate crash report.
 	g_ExceptionManager = new ExceptionManager();
 
-	// Set current process handle in order for CxbxrShutDown to work properly.
-	g_CurrentProcessHandle = GetCurrentProcess(); // OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
-
 	// First of all, check if the EmuShared version matches the emu version and abort otherwise
 	char GitVersionEmuShared[GitVersionMaxLength];
 	g_EmuShared->GetGitVersion(GitVersionEmuShared);
 	if (std::strncmp(GitVersionEmuShared, GetGitVersionStr(), GetGitVersionLength()) != 0) {
 		PopupError(nullptr, "Mismatch detected between EmuShared and cxbx.exe/cxbxr-emu.dll, aborting."
 			"\n\nPlease extract all contents from zip file and do not mix with older/newer builds.");
-		CxbxrShutDown();
+		CxbxKrnlShutDown();
 		return;
 	}
 
@@ -877,6 +1076,8 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	int BootFlags;
 	g_EmuShared->GetBootFlags(&BootFlags);
 
+	g_CurrentProcessHandle = GetCurrentProcess(); // OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
+
 	// Set up the logging variables for the kernel process during initialization.
 	log_sync_config();
 
@@ -911,11 +1112,13 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	}
 
 	if (dwExitCode != EXIT_SUCCESS) {// Stop emulation
-		CxbxrShutDown();
+		CxbxKrnlShutDown();
 	}
 
 	/* Must be called after CxbxrInitFilePaths and previous kernel process shutdown. */
-	CxbxrLockFilePath();
+	if (!CxbxLockFilePath()) {
+		return;
+	}
 
 	FILE* krnlLog = CxbxrKrnlSetupVerboseLog(BootFlags);
 
@@ -966,8 +1169,7 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	// using XeLoadImage from LaunchDataPage->Header.szLaunchPath
 
 	// Now we can load the XBE :
-	HardwareModel hardwareModel = HardwareModel::Revision1_6; // It is configured by CxbxrKrnlXbeSystemSelector function according to console type.
-	if (!CxbxrKrnlXbeSystemSelector(BootFlags, reserved_systems, blocks_reserved, hardwareModel)) {
+	if (!CxbxrKrnlXbeSystemSelector(BootFlags, reserved_systems, blocks_reserved)) {
 		return;
 	}
 
@@ -995,8 +1197,7 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 			(Xbe::Header*)CxbxKrnl_Xbe->m_Header.dwBaseAddr,
 			CxbxKrnl_Xbe->m_Header.dwSizeofHeaders,
 			(void(*)())EntryPoint,
- 			BootFlags,
-			hardwareModel
+ 			BootFlags
 		);
 	}
 
@@ -1021,15 +1222,9 @@ static void CxbxrLogDumpXbeInfo(Xbe::LibraryVersion* libVersionInfo)
 
 		EmuLogInit(LOG_LEVEL::INFO, "XBE TitleID : %s", FormatTitleId(g_pCertificate->dwTitleId).c_str());
 		EmuLogInit(LOG_LEVEL::INFO, "XBE TitleID (Hex) : 0x%s", titleIdHex.str().c_str());
-		if (CxbxKrnl_Xbe != nullptr) {
-			EmuLogInit(LOG_LEVEL::INFO, "XBE Version : %d.%d", CxbxKrnl_Xbe->GetDiscVersion(), CxbxKrnl_Xbe->GetPatchVersion());
-		}
-		EmuLogInit(LOG_LEVEL::INFO, "XBE Version (Hex): %08X", g_pCertificate->dwVersion);
+		EmuLogInit(LOG_LEVEL::INFO, "XBE Version : 1.%02d", g_pCertificate->dwVersion);
 		EmuLogInit(LOG_LEVEL::INFO, "XBE TitleName : %.40ls", g_pCertificate->wsTitleName);
-		if (CxbxKrnl_Xbe != nullptr) {
-			EmuLogInit(LOG_LEVEL::INFO, "XBE Region : %s", CxbxKrnl_Xbe->GameRegionToString().c_str());
-		}
-		EmuLogInit(LOG_LEVEL::INFO, "XBE Region (Hex): %08X", g_pCertificate->dwGameRegion);
+		EmuLogInit(LOG_LEVEL::INFO, "XBE Region : %s", CxbxKrnl_Xbe->GameRegionToString());
 	}
 
 	// Dump Xbe library build numbers
@@ -1061,13 +1256,8 @@ static void CxbxrKrnlInitHacks()
 	Xbe::Header            *pXbeHeader,
 	uint32_t                dwXbeHeaderSize,
 	void(*Entry)(),
-	int BootFlags,
-	HardwareModel hardwareModel)
+	int BootFlags)
 {
-	unsigned Host2XbStackBaseReserved = 0;
-	__asm mov Host2XbStackBaseReserved, esp;
-	unsigned Host2XbStackSizeReserved = EmuGenerateStackSize(Host2XbStackBaseReserved, 0);
-	__asm sub esp, Host2XbStackSizeReserved;
     // Set windows timer period to 1ms
     // Windows will automatically restore this value back to original on program exit
     // But with this, we can replace some busy loops with sleeps.
@@ -1086,11 +1276,11 @@ static void CxbxrKrnlInitHacks()
 	g_pCertificate = &CxbxKrnl_Xbe->m_Certificate;
 
 	// Initialize timer subsystem
-	timer_init();
+	Timer_Init();
 	// for unicode conversions
 	setlocale(LC_ALL, "English");
-	// Initialize DPC global
-	InitDpcData();
+	// Initialize time-related variables for the kernel and the timers
+	CxbxInitPerformanceCounters();
 #ifdef _DEBUG
 //	PopupCustom(LOG_LEVEL::INFO, "Attach a Debugger");
 //  Debug child processes using https://marketplace.visualstudio.com/items?itemName=GreggMiskelly.MicrosoftChildProcessDebuggingPowerTool
@@ -1150,82 +1340,17 @@ static void CxbxrKrnlInitHacks()
 	CxbxResolveHostToFullPath(xbePath, "xbe's file");
 
 	std::filesystem::path relative_path;
-	CxbxrKrnlGetRelativePath(relative_path);
+	size_t lastFind = CxbxrKrnlGetRelativePath(relative_path);
 
-	// Make sure the Xbox1 code runs on one core (as the box itself has only 1 CPU,
-	// this will better aproximate the environment with regard to multi-threading) :
-	EmuLogInit(LOG_LEVEL::DEBUG, "Determining CPU affinity.");
-	g_AffinityPolicy = AffinityPolicy::InitPolicy();
+	g_DiskBasePathHandle = CreateFile(g_DiskBasePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
 
-	// Create a kpcr for this thread. This is necessary because ObInitSystem needs to access the irql. This must also be done before
-	// CxbxInitWindow because that function creates the xbox EmuUpdateTickCount thread
-	EmuGenerateFS<true>(xbox::zeroptr, Host2XbStackBaseReserved, Host2XbStackSizeReserved);
-	if (!xbox::ObInitSystem()) {
-		CxbxrAbortEx(LOG_PREFIX_INIT, "Unable to intialize ObInitSystem.");
-	}
-	xbox::PsInitSystem();
-	xbox::KiInitSystem();
-	xbox::RtlInitSystem();
-
-	// initialize graphics
-	EmuLogInit(LOG_LEVEL::DEBUG, "Initializing render window.");
-	CxbxInitWindow();
-
-	// Now process the boot flags to see if there are any special conditions to handle
-	if (BootFlags & BOOT_EJECT_PENDING) {} // TODO
-	if (BootFlags & BOOT_FATAL_ERROR)
-	{
-		// If we are here it means we have been rebooted to display the fatal error screen. The error code is set
-		// to 0x15 and the led flashes with the sequence green, red, red, red
-
-		SetLEDSequence(0xE1);
-		CxbxKrnlPrintUEM(FATAL_ERROR_REBOOT_ROUTINE); // won't return
-	}
-	if (BootFlags & BOOT_SKIP_ANIMATION) {} // TODO
-	if (BootFlags & BOOT_RUN_DASHBOARD) {} // TODO
-
-	CxbxInitAudio();
-
-	// EmuHLEIntercept must be call before MapThunkTable, otherwise scanning for symbols will not work properly.
-	EmuHLEIntercept(pXbeHeader);
-
-	// Decode kernel thunk table address :
-	uint32_t kt = CxbxKrnl_Xbe->m_Header.dwKernelImageThunkAddr;
-	kt ^= XOR_KT_KEY[to_underlying(CxbxKrnl_Xbe->GetXbeType())];
-
-	// Process the Kernel thunk table to map Kernel function calls to their actual address :
-	MapThunkTable((uint32_t *)kt, CxbxKrnl_KernelThunkTable);
-
-	// Does this xbe import any other libraries?
-	if (CxbxKrnl_Xbe->m_Header.dwNonKernelImportDirAddr) {
-		ImportLibraries((XbeImportEntry *)CxbxKrnl_Xbe->m_Header.dwNonKernelImportDirAddr);
-	}
-
-	if (!bLLE_USB) {
-		SetupXboxDeviceTypes();
-	}
-
-	InitXboxHardware(hardwareModel);
-
-	// Read Xbox video mode from the SMC, store it in HalBootSMCVideoMode
-	xbox::HalReadSMBusValue(SMBUS_ADDRESS_SYSTEM_MICRO_CONTROLLER, SMC_COMMAND_AV_PACK, FALSE, (xbox::PULONG)&xbox::HalBootSMCVideoMode);
-
-	g_InputDeviceManager.Initialize(false, g_hEmuWindow);
-
-	// Now the hardware devices exist, couple the EEPROM buffer to it's device
-	g_EEPROM->SetEEPROM((uint8_t*)EEPROM);
-
-	if (!bLLE_GPU)
-	{
-		EmuLogInit(LOG_LEVEL::DEBUG, "Initializing Direct3D.");
-		EmuD3DInit();
-	}
+	CxbxrKrnlRegisterDevicePaths();
 
 	bool isEmuDisk = CxbxrIsPathInsideEmuDisk(relative_path);
-	CxbxrSetupDrives(relative_path, BootFlags);
+	CxbxrKrnlSetupCdRom0Path(BootFlags, lastFind, relative_path, isEmuDisk);
 
 	std::mbstate_t ps = std::mbstate_t();
-	const char* src = g_MuBasePath.c_str();
+	const char *src = g_MuBasePath.c_str();
 	std::wstring wMuBasePath(g_MuBasePath.size(), L'0');
 	std::mbsrtowcs(wMuBasePath.data(), &src, wMuBasePath.size(), &ps);
 	g_io_mu_metadata = new io_mu_metadata(wMuBasePath);
@@ -1236,7 +1361,8 @@ static void CxbxrKrnlInitHacks()
 		if (xbox::LaunchDataPage == xbox::zeroptr) {
 			// First launch and possible launch to dashboard
 			if (isEmuDisk) {
-				fileName = CxbxrDiskDeviceByHostPath(xbePath);
+				XboxDevice* xbeLoc = CxbxDeviceByHostPath(xbePath.string());
+				fileName = xbeLoc->XboxDevicePath;
 			}
 			// Otherwise it might be from CdRom0 device.
 			else {
@@ -1273,44 +1399,82 @@ static void CxbxrKrnlInitHacks()
 		xbox::XeImageFileName.Length = static_cast<xbox::ushort_xt>(fileName.size());
 		xbox::XeImageFileName.MaximumLength = xbox::XeImageFileName.Length + 1;
 		xbox::XeImageFileName.Buffer = (PCHAR)xbox::ExAllocatePoolWithTag(xbox::XeImageFileName.MaximumLength, 'nFeX');
-		strncpy_s(xbox::XeImageFileName.Buffer, xbox::XeImageFileName.MaximumLength, fileName.c_str(), fileName.size());
+		strncpy_s(xbox::XeImageFileName.Buffer, xbox::XeImageFileName.MaximumLength,fileName.c_str(), fileName.size());
 		EmuLogInit(LOG_LEVEL::INFO, "XeImageFileName = %s", xbox::XeImageFileName.Buffer);
 	}
 
+	CxbxrLogDumpXbeInfo(pLibraryVersion);
+
+	CxbxKrnlRegisterThread(GetCurrentThread());
+
+	// Make sure the Xbox1 code runs on one core (as the box itself has only 1 CPU,
+	// this will better aproximate the environment with regard to multi-threading) :
+	EmuLogInit(LOG_LEVEL::DEBUG, "Determining CPU affinity.");
+	g_AffinityPolicy = AffinityPolicy::InitPolicy();
+
+	// initialize graphics
+	EmuLogInit(LOG_LEVEL::DEBUG, "Initializing render window.");
+	CxbxInitWindow(true);
+
+	// Now process the boot flags to see if there are any special conditions to handle
+	if (BootFlags & BOOT_EJECT_PENDING) {} // TODO
+	if (BootFlags & BOOT_FATAL_ERROR)
+	{
+		// If we are here it means we have been rebooted to display the fatal error screen. The error code is set
+		// to 0x15 and the led flashes with the sequence green, red, red, red
+
+		SetLEDSequence(0xE1);
+		CxbxKrnlPrintUEM(FATAL_ERROR_REBOOT_ROUTINE); // won't return
+	}
+	if (BootFlags & BOOT_SKIP_ANIMATION) {} // TODO
+	if (BootFlags & BOOT_RUN_DASHBOARD) {} // TODO
+
+	CxbxInitAudio();
+
+	// EmuHLEIntercept must be call before MapThunkTable, otherwise scanning for symbols will not work properly.
+	EmuHLEIntercept(pXbeHeader);
+
+	// Decode kernel thunk table address :
+	uint32_t kt = CxbxKrnl_Xbe->m_Header.dwKernelImageThunkAddr;
+	kt ^= XOR_KT_KEY[to_underlying(CxbxKrnl_Xbe->GetXbeType())];
+
+	// Process the Kernel thunk table to map Kernel function calls to their actual address :
+	MapThunkTable((uint32_t *)kt, CxbxKrnl_KernelThunkTable);
+
+	// Does this xbe import any other libraries?
+	if (CxbxKrnl_Xbe->m_Header.dwNonKernelImportDirAddr) {
+		ImportLibraries((XbeImportEntry *)CxbxKrnl_Xbe->m_Header.dwNonKernelImportDirAddr);
+	}
+
+	if (!bLLE_USB) {
+		SetupXboxDeviceTypes();
+	}
+
+	InitXboxHardware(HardwareModel::Revision1_5); // TODO : Make configurable
+
+	// Read Xbox video mode from the SMC, store it in HalBootSMCVideoMode
+	xbox::HalReadSMBusValue(SMBUS_ADDRESS_SYSTEM_MICRO_CONTROLLER, SMC_COMMAND_AV_PACK, FALSE, (xbox::PULONG)&xbox::HalBootSMCVideoMode);
+
+	g_InputDeviceManager.Initialize(false, g_hEmuWindow);
+
+	// Now the hardware devices exist, couple the EEPROM buffer to it's device
+	g_EEPROM->SetEEPROM((uint8_t*)EEPROM);
+
+	if (!bLLE_GPU)
+	{
+		EmuLogInit(LOG_LEVEL::DEBUG, "Initializing Direct3D.");
+		EmuD3DInit();
+	}
+	
 	if (CxbxDebugger::CanReport())
 	{
 		CxbxDebugger::ReportDebuggerInit(CxbxKrnl_Xbe->m_szAsciiTitle);
 	}
 
-	CxbxrLogDumpXbeInfo(pLibraryVersion);
-
 	// Apply Media Patches to bypass Anti-Piracy checks
 	// Required until we perfect emulation of X2 DVD Authentication
 	// See: https://multimedia.cx/eggs/xbox-sphinx-protocol/
 	ApplyMediaPatches();
-
-	// Verify that the emulator region matches the game region, if not, show a warning
-	// that it may not work.
-	if (!(g_pCertificate->dwGameRegion & EEPROM->EncryptedSettings.GameRegion))
-	{
-		auto expected = CxbxKrnl_Xbe->GameRegionToString();
-		auto actual = CxbxKrnl_Xbe->GameRegionToString(EEPROM->EncryptedSettings.GameRegion);
-
-		std::stringstream ss;
-		ss << "The loaded title is designed for region: " << expected << "\n";
-		ss << "However Cxbx-Reloaded is configured as: " << actual << "\n\n";
-		ss << "This means that you may encounter emulation issues\n\n";
-		ss << "You can fix this by changing your emulated Xbox region in EEPROM Settings\n\n";
-		ss << "Please do not submit bug reports that result from incorrect region flags\n\n";
-		ss << "Would you like to attempt emulation anyway?";
-
-		PopupReturn ret = PopupWarningEx(nullptr, PopupButtons::YesNo, PopupReturn::No, ss.str().c_str());
-		if (ret != PopupReturn::Yes)
-		{
-			CxbxrShutDown();
-		}
-	}
-	
 
 	// Chihiro games require more patches
 	// The chihiro BIOS does this to bypass XAPI cache init
@@ -1318,7 +1482,8 @@ static void CxbxrKrnlInitHacks()
 		CxbxKrnl_XbeHeader->dwInitFlags.bDontSetupHarddisk = true;
 	}
 
-	if (!g_SkipRdtscPatching) {
+	if(!g_SkipRdtscPatching)
+	{ 
 		PatchRdtscInstructions();
 	}
 
@@ -1327,23 +1492,41 @@ static void CxbxrKrnlInitHacks()
 
 	EmuInitFS();
 
+	InitXboxThread();
+	g_AffinityPolicy->SetAffinityXbox();
+	if (!xbox::ObInitSystem()) {
+		CxbxrKrnlAbortEx(LOG_PREFIX_INIT, "Unable to intialize ObInitSystem.");
+	}
+	xbox::KiInitSystem();
+
+#ifdef CHIHIRO_WORK
 	// If this title is Chihiro, Setup JVS
 	if (g_bIsChihiro) {
 		JVS_Init();
 	}
+#endif
 
 	EmuX86_Init();
-	// Start the event thread
-	xbox::HANDLE hThread;
-	xbox::PsCreateSystemThread(&hThread, xbox::zeroptr, system_events, xbox::zeroptr, FALSE);
-	// Launch the xbe
-	xbox::PsCreateSystemThread(&hThread, xbox::zeroptr, CxbxLaunchXbe, Entry, FALSE);
+	// Create the interrupt processing thread
+	DWORD dwThreadId;
+	HANDLE hThread = (HANDLE)_beginthreadex(NULL, NULL, CxbxKrnlInterruptThread, NULL, NULL, (unsigned int*)&dwThreadId);
+	// Start the kernel clock thread
+	TimerObject* KernelClockThr = Timer_Create(CxbxKrnlClockThread, nullptr, "Kernel clock thread", false);
+	Timer_Start(KernelClockThr, SCALE_MS_IN_NS);
 
-	xbox::KeRaiseIrqlToDpcLevel();
-	while (true) {
-		xbox::KeWaitForDpc();
-		ExecuteDpcQueue();
-	}
+	EmuLogInit(LOG_LEVEL::DEBUG, "Calling XBE entry point...");
+	CxbxLaunchXbe(Entry);
+
+	// FIXME: Wait for Cxbx to exit or error fatally
+	Sleep(INFINITE);
+
+	EmuLogInit(LOG_LEVEL::DEBUG, "XBE entry point returned");
+	fflush(stdout);
+
+	CxbxUnlockFilePath();
+
+	//	EmuShared::Cleanup();   FIXME: commenting this line is a bad workaround for issue #617 (https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/issues/617)
+    CxbxKrnlTerminateThread();
 }
 
 // REMARK: the following is useless, but PatrickvL has asked to keep it for documentation purposes
@@ -1357,50 +1540,145 @@ static void CxbxrKrnlInitHacks()
 	}
 };*/
 
-void CxbxrKrnlSuspendThreads()
+[[noreturn]] void CxbxrKrnlAbortEx(CXBXR_MODULE cxbxr_module, const char *szErrorMessage, ...)
 {
-	xbox::PLIST_ENTRY ThreadListEntry = KiUniqueProcess.ThreadListHead.Flink;
-	std::vector<HANDLE> threads;
-	threads.reserve(KiUniqueProcess.StackCount);
+    g_bEmuException = true;
 
-	// Don't use EmuKeGetPcr because that asserts kpcr
-	xbox::KPCR* Pcr = reinterpret_cast<xbox::PKPCR>(__readfsdword(TIB_ArbitraryDataSlot));
+    CxbxKrnlResume();
 
-	// If there's nothing in list entry, skip this step.
-	if (!ThreadListEntry) {
-		return;
-	}
+    // print out error message (if exists)
+    if(szErrorMessage != NULL)
+    {
+        char szBuffer2[1024];
+        va_list argp;
 
-	while (ThreadListEntry != &KiUniqueProcess.ThreadListHead) {
-		xbox::HANDLE UniqueThread = CONTAINING_RECORD(ThreadListEntry, xbox::ETHREAD, Tcb.ThreadListEntry)->UniqueThread;
-		if (UniqueThread) {
-			// Current thread is an xbox thread
-			if (Pcr) {
-				const auto& nHandle = GetNativeHandle<true>(UniqueThread);
-				if (nHandle) {
-					// We do not want to suspend current thread, so we let it skip this one.
-					if (*nHandle != NtCurrentThread()) {
-						threads.push_back(*nHandle);
-					}
-				}
-			}
-			// Otherwise, convert all UniqueThread to host thead handles.
-			else {
-				const auto& nHandle = GetNativeHandle<false>(UniqueThread);
-				if (nHandle) {
-					threads.push_back(*nHandle);
-				}
-			}
+        va_start(argp, szErrorMessage);
+        vsprintf(szBuffer2, szErrorMessage, argp);
+        va_end(argp);
+
+		(void)PopupCustomEx(nullptr, cxbxr_module, LOG_LEVEL::FATAL, PopupIcon::Error, PopupButtons::Ok, PopupReturn::Ok, "Received Fatal Message:\n\n* %s\n", szBuffer2); // Will also EmuLogEx
+    }
+
+	EmuLogInit(LOG_LEVEL::INFO, "MAIN: Terminating Process");
+    fflush(stdout);
+
+    // cleanup debug output
+    {
+        FreeConsole();
+
+        char buffer[16];
+
+        if(GetConsoleTitle(buffer, 16) != NULL)
+            freopen("nul", "w", stdout);
+    }
+
+	CxbxKrnlShutDown();
+}
+
+void CxbxKrnlRegisterThread(HANDLE hThread)
+{
+	// we must duplicate this handle in order to retain Suspend/Resume thread rights from a remote thread
+	{
+		HANDLE hDupHandle = NULL;
+
+		if (DuplicateHandle(g_CurrentProcessHandle, hThread, g_CurrentProcessHandle, &hDupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+			hThread = hDupHandle; // Thread handle was duplicated, continue registration with the duplicate
 		}
-		ThreadListEntry = ThreadListEntry->Flink;
-	}
-
-	for (const auto& thread : threads) {
-		DWORD PrevCount = SuspendThread(thread);
-		if (PrevCount == -1) {
-			EmuLog(LOG_LEVEL::ERROR2, "Unable to suspend thread 0x%X for: %s", thread, WinError2Str().c_str());
+		else {
+			auto message = CxbxGetLastErrorString("DuplicateHandle");
+			EmuLog(LOG_LEVEL::WARNING, message.c_str());
 		}
 	}
+
+	g_hThreads.push_back(hThread);
+}
+
+void CxbxKrnlSuspend()
+{
+    if(g_bEmuSuspended || g_bEmuException)
+        return;
+
+    for (auto it = g_hThreads.begin(); it != g_hThreads.end(); ++it)
+    {
+        DWORD dwExitCode;
+
+        if(GetExitCodeThread(*it, &dwExitCode) && dwExitCode == STILL_ACTIVE) {
+            // suspend thread if it is active
+            SuspendThread(*it);
+        } else {
+            // remove thread from thread list if it is dead
+			g_hThreads.erase(it);
+        }
+    }
+
+    g_bEmuSuspended = true;
+}
+
+void CxbxKrnlResume()
+{
+    if(!g_bEmuSuspended)
+        return;
+
+	for (auto it = g_hThreads.begin(); it != g_hThreads.end(); ++it)
+	{
+		DWORD dwExitCode;
+
+		if (GetExitCodeThread(*it, &dwExitCode) && dwExitCode == STILL_ACTIVE) {
+			// resume thread if it is active
+			ResumeThread(*it);
+		}
+		else {
+			// remove thread from thread list if it is dead
+			g_hThreads.erase(it);
+		}
+	}
+
+    g_bEmuSuspended = false;
+}
+
+void CxbxKrnlShutDown(bool is_reboot)
+{
+	if (!is_reboot) {
+		// Clear all kernel boot flags. These (together with the shared memory) persist until Cxbx-Reloaded is closed otherwise.
+		int BootFlags = 0;
+		g_EmuShared->SetBootFlags(&BootFlags);
+	}
+
+	// NOTE: This causes a hang when exiting while NV2A is processing
+	// This is okay for now: It won't leak memory or resources since TerminateProcess will free everything
+	// delete g_NV2A; // TODO : g_pXbox
+
+	// Shutdown the input device manager
+	g_InputDeviceManager.Shutdown();
+
+	if (g_io_mu_metadata) {
+		delete g_io_mu_metadata;
+		g_io_mu_metadata = nullptr;
+	}
+
+	// Shutdown the memory manager
+	g_VMManager.Shutdown();
+
+	// Shutdown the render manager
+	if (g_renderbase != nullptr) {
+		g_renderbase->Shutdown();
+		g_renderbase = nullptr;
+	}
+
+	CxbxUnlockFilePath();
+
+	if (CxbxKrnl_hEmuParent != NULL && !is_reboot) {
+		SendMessage(CxbxKrnl_hEmuParent, WM_PARENTNOTIFY, WM_DESTROY, 0);
+	}
+
+	EmuShared::Cleanup();
+
+	if (g_ExceptionManager) {
+		delete g_ExceptionManager;
+		g_ExceptionManager = nullptr;
+	}
+
+	TerminateProcess(g_CurrentProcessHandle, 0);
 }
 
 void CxbxKrnlPrintUEM(ULONG ErrorCode)
@@ -1430,13 +1708,13 @@ void CxbxKrnlPrintUEM(ULONG ErrorCode)
 		xbox::ExSaveNonVolatileSetting(xbox::XC_MAX_ALL, Type, &Eeprom, sizeof(Eeprom));
 	}
 	else {
-		CxbxrAbort("Could not display the fatal error screen");
+		CxbxrKrnlAbort("Could not display the fatal error screen");
 	}
 
 	if (g_bIsChihiro)
 	{
 		// The Chihiro doesn't display the UEM
-		CxbxrAbort("The running Chihiro xbe has encountered a fatal error and needs to close");
+		CxbxrKrnlAbort("The running Chihiro xbe has encountered a fatal error and needs to close");
 	}
 
 	g_CxbxFatalErrorCode = ErrorCode;
@@ -1488,7 +1766,12 @@ void CxbxPrintUEMInfo(ULONG ErrorCode)
 	}
 }
 
+[[noreturn]] void CxbxKrnlTerminateThread()
+{
+    TerminateThread(GetCurrentThread(), 0);
+}
+
 void CxbxKrnlPanic()
 {
-    CxbxrAbort("Kernel Panic!");
+    CxbxrKrnlAbort("Kernel Panic!");
 }
